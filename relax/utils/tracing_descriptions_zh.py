@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Optional Chinese span semantics using the standard description attribute.
+"""Chinese span semantics for name-based lookup in the offline viewer.
 
-Register this processor instead of the English processor to capture Chinese.
-The viewer displays captured descriptions verbatim; this catalog is not a UI
-translation layer.
+Descriptions live in this catalog, rather than in every collected span. The
+optional processor remains available for legacy callers only.
 """
 
 from __future__ import annotations
@@ -157,11 +156,20 @@ NATIVE_DESCRIPTIONS = {
     "quick_finish": "通过提前完成路径结束 SGLang 请求。",
 }
 
+VIEW_DESCRIPTIONS = {
+    "train.wait_rollout.merged": "训练前等待当前 Step 的 Rollout 数据及共卡服务就绪。\n此为合并后的轮询区间，包含各次轮询之间的间隔。",
+    "sglang.forward": "合并当前 Rank、当前 Rollout Step 的 Prefill 与 Decode。\n显示最早开始至最晚结束的 Host 区间，包含其中的间隔。",
+}
+
 
 def describe_span(name: str, attributes: Mapping[str, Any] | None = None) -> str:
     """Return Chinese span semantics without changing training execution."""
     attributes = attributes or {}
-    if name == "worker.init" and attributes.get("relax.init.kind") == "metadata_snapshot":
+    if name == "train.wait_rollout" and attributes.get("relax.simulation.synthetic") is True:
+        text = VIEW_DESCRIPTIONS["train.wait_rollout.merged"]
+    elif name == "sglang.forward" and attributes.get("relax.simulation.synthetic") is True:
+        text = VIEW_DESCRIPTIONS["sglang.forward"]
+    elif name == "worker.init" and attributes.get("relax.init.kind") == "metadata_snapshot":
         text = "首个采样请求时记录的 SGLang Worker 身份及通信组零时长快照；不表示模型初始化耗时。"
     elif name in DESCRIPTIONS:
         text = DESCRIPTIONS[name]
@@ -202,3 +210,18 @@ def description_processor() -> Any:
             span.set_attribute(DESCRIPTION_ATTRIBUTE, describe_span(span.name, span.attributes))
 
     return DescriptionProcessor()
+
+
+def description_table() -> dict[str, str]:
+    """Return one shared table; extra keys identify existing semantic
+    variants."""
+    table = {name: describe_span(name) for name in (*DESCRIPTIONS, *NATIVE_DESCRIPTIONS)}
+    for name, key, attrs in (
+        ("worker.init", "worker.init#metadata_snapshot", {"relax.init.kind": "metadata_snapshot"}),
+        ("train.wait_rollout", "train.wait_rollout#merged", {"relax.simulation.synthetic": True}),
+        ("sglang.forward", "sglang.forward#merged", {"relax.simulation.synthetic": True}),
+    ):
+        table[key] = describe_span(name, attrs)
+    for prefix in ("Req ", "Scheduler", "Tokenizer", "Detokenizer"):
+        table[prefix + "*"] = describe_span(prefix + "catalog-example")
+    return table
