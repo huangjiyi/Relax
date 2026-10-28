@@ -47,6 +47,8 @@ from relax.utils.memory_utils import available_memory, clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
+from relax.utils.tracing import stage, traced
+from relax.utils.tracing_megatron import schedule_scope
 from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
@@ -405,12 +407,13 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
-        ModelType.encoder_or_decoder,
-        wrap_with_ddp=role in ["actor", "critic"],
-    )
-    validate_mtp_only_trainable_params(args, model)
+    with stage("worker.init.build_model", level=2):
+        model = get_model(
+            wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
+            ModelType.encoder_or_decoder,
+            wrap_with_ddp=role in ["actor", "critic"],
+        )
+        validate_mtp_only_trainable_params(args, model)
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
@@ -445,18 +448,19 @@ def setup_model_and_optimizer(
     if args.only_load_weight:
         return model, None, None
     # Optimizer
-    kwargs = _build_optimizer_config_kwargs(args)
-    config = OptimizerConfig(**kwargs)
-    config.timers = None
-    _validate_vit_lr_trainable_params(args, model)
+    with stage("worker.init.optimizer", level=2):
+        kwargs = _build_optimizer_config_kwargs(args)
+        config = OptimizerConfig(**kwargs)
+        config.timers = None
+        _validate_vit_lr_trainable_params(args, model)
 
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        config_overrides=_build_optimizer_config_overrides(args, config),
-        use_gloo_process_groups=args.use_gloo_process_groups,
-    )
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+        optimizer = get_megatron_optimizer(
+            config=config,
+            model_chunks=model,
+            config_overrides=_build_optimizer_config_overrides(args, config),
+            use_gloo_process_groups=args.use_gloo_process_groups,
+        )
+        opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 
 
@@ -952,15 +956,16 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
-        forward_data_store += forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches[step_id],
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            forward_only=True,
-        )
+        with schedule_scope(forward_only=True, **{"relax.optimizer_step": step_id}):
+            forward_data_store += forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches[step_id],
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                forward_only=True,
+            )
         if getattr(args, "empty_unused_memory_level", 0) >= 1:
             device_module.empty_cache()
 
@@ -1055,6 +1060,7 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     return bool(signal.item())
 
 
+@traced("megatron.iteration", step_arg="rollout_id", level=2)
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1324,16 +1330,17 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+    with schedule_scope(**{"relax.optimizer_step": step_id, "relax.num_microbatches": num_microbatches}):
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1362,50 +1369,55 @@ def train_one_step(
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
-    valid_step = True
-    if _is_global_zero_token_step(losses_reduced):
-        # No effective loss tokens anywhere in the global batch. Gradients are
-        # exactly zero (the loss is zero-connected), so skip both the parameter
-        # and LR scheduler updates; momentum / weight decay must not move the
-        # model on a no-signal step. Every rank agrees because the decision is
-        # reduced over DP+CP and broadcast across the pipeline.
-        logger.warning(
-            "Training step %d has zero effective loss tokens globally; skipping optimizer and LR scheduler updates.",
-            step_id,
-        )
-        # No parameter update happened, so critic movement checks must not count
-        # this step as a successful update.
-        update_successful = False
-        grad_norm = 0.0
-        num_zeros_in_grad = None
-    else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-        if not getattr(args, "check_for_nan_in_loss_and_grad", True):
-            # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
-            # Detect overflow via the documented (False, None, None) return signature.
-            found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
-            if found_inf_flag:
-                valid_step = False
-                current_scale = optimizer.get_loss_scale().item()
-                logger.warning(
-                    "Inf found in gradients (step_id=%d, loss_scale=%s), skipping parameter "
-                    "update (dynamic loss scaling will reduce scale)",
-                    step_id,
-                    current_scale,
-                )
-            else:
-                if isinstance(grad_norm, torch.Tensor):
-                    valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
-                else:
-                    valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
-
-        if valid_step:
-            # Update learning rate.
-            assert update_successful
-            opt_param_scheduler.step(increment=step_global_batch_size)
+    with stage("megatron.optimizer", level=2, **{"relax.backend": "megatron"}) as optimizer_span:
+        valid_step = True
+        if _is_global_zero_token_step(losses_reduced):
+            # No effective loss tokens anywhere in the global batch. Gradients are
+            # exactly zero (the loss is zero-connected), so skip both the parameter
+            # and LR scheduler updates; momentum / weight decay must not move the
+            # model on a no-signal step. Every rank agrees because the decision is
+            # reduced over DP+CP and broadcast across the pipeline.
+            logger.warning(
+                "Training step %d has zero effective loss tokens globally; skipping optimizer and LR scheduler updates.",
+                step_id,
+            )
+            # No parameter update happened, so critic movement checks must not count
+            # this step as a successful update.
+            update_successful = False
+            grad_norm = 0.0
+            num_zeros_in_grad = None
         else:
-            grad_norm = float("nan")
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+            if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+                # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
+                # Detect overflow via the documented (False, None, None) return signature.
+                found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
+                if found_inf_flag:
+                    valid_step = False
+                    current_scale = optimizer.get_loss_scale().item()
+                    logger.warning(
+                        "Inf found in gradients (step_id=%d, loss_scale=%s), skipping parameter "
+                        "update (dynamic loss scaling will reduce scale)",
+                        step_id,
+                        current_scale,
+                    )
+                else:
+                    if isinstance(grad_norm, torch.Tensor):
+                        valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+                    else:
+                        valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+
+            if valid_step:
+                # Update learning rate.
+                assert update_successful
+                with stage("megatron.scheduler", level=2):
+                    opt_param_scheduler.step(increment=step_global_batch_size)
+            else:
+                grad_norm = float("nan")
+
+        if optimizer_span is not None:
+            optimizer_span.set_attribute("relax.optimizer.skipped", not bool(update_successful))
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
@@ -1427,38 +1439,41 @@ def train_one_step(
         device_module.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Average loss across microbatches.
-        keys = losses_reduced[0]["keys"]
-        values = None
-        for x in losses_reduced:
-            if values is None:
-                values = x["values"]
-            else:
-                values += x["values"]
-        assert len(keys) + 1 == values.numel()
-        torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+        with stage("megatron.loss_reduce", level=2):
+            # Average loss across microbatches.
+            keys = losses_reduced[0]["keys"]
+            values = None
+            for x in losses_reduced:
+                if values is None:
+                    values = x["values"]
+                else:
+                    values += x["values"]
+            assert len(keys) + 1 == values.numel()
+            torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
-        loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
-        values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
-        num_samples_or_tokens = (
-            values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
-        )
-        if num_samples_or_tokens == 0:
-            logger.warning(
-                "Training step %d has zero effective loss tokens; reporting zero loss metrics for this no-signal step.",
-                step_id,
+            loss_reduced = packing_metrics.reduce(
+                mpu.get_data_parallel_group(with_context_parallel=True), values.device
             )
-        # Per-token and sequence-classification metrics use the all-reduced
-        # effective count. RL sample-mean metrics use the step's logical GBS.
-        loss_reduced.update(normalize_reduced_loss_metrics(keys, [num_samples_or_tokens, *values[1:]]))
-        if "rm/_score_chosen_second_moment" in loss_reduced:
-            chosen_second = loss_reduced.pop("rm/_score_chosen_second_moment")
-            rejected_second = loss_reduced.pop("rm/_score_rejected_second_moment")
-            chosen_mean = loss_reduced["rm/score_chosen_mean"]
-            rejected_mean = loss_reduced["rm/score_rejected_mean"]
-            loss_reduced["rm/score_chosen_std"] = math.sqrt(max(chosen_second - chosen_mean**2, 0.0))
-            loss_reduced["rm/score_rejected_std"] = math.sqrt(max(rejected_second - rejected_mean**2, 0.0))
+            values = values.tolist()
+            is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+            num_samples_or_tokens = (
+                values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
+            )
+            if num_samples_or_tokens == 0:
+                logger.warning(
+                    "Training step %d has zero effective loss tokens; reporting zero loss metrics for this no-signal step.",
+                    step_id,
+                )
+            # Per-token and sequence-classification metrics use the all-reduced
+            # effective count. RL sample-mean metrics use the step's logical GBS.
+            loss_reduced.update(normalize_reduced_loss_metrics(keys, [num_samples_or_tokens, *values[1:]]))
+            if "rm/_score_chosen_second_moment" in loss_reduced:
+                chosen_second = loss_reduced.pop("rm/_score_chosen_second_moment")
+                rejected_second = loss_reduced.pop("rm/_score_rejected_second_moment")
+                chosen_mean = loss_reduced["rm/score_chosen_mean"]
+                rejected_mean = loss_reduced["rm/score_rejected_mean"]
+                loss_reduced["rm/score_chosen_std"] = math.sqrt(max(chosen_second - chosen_mean**2, 0.0))
+                loss_reduced["rm/score_rejected_std"] = math.sqrt(max(rejected_second - rejected_mean**2, 0.0))
 
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
@@ -1471,6 +1486,7 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+@traced("train.compute", step_arg="rollout_id")
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -2078,6 +2094,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         raise
 
 
+@traced("worker.init.model_optimizer", level=2)
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:

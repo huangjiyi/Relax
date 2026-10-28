@@ -47,6 +47,7 @@ from relax.utils.s3_model_loader import (
     resolve_s3_model_metadata_to_shm,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory
+from relax.utils.tracing import stage, subprocess_context, traced
 
 
 logger = get_logger(__name__)
@@ -384,6 +385,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
+@traced("rollout.init.server_launch", level=2)
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
@@ -400,7 +402,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     )
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
-    p.start()
+    with subprocess_context():
+        p.start()
 
     if server_args.node_rank != 0:
         return p
@@ -414,6 +417,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     return p
 
 
+@traced("rollout.init.health_wait", level=2)
 def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
     """Wait until the server at *base_url* is healthy.
 
@@ -515,6 +519,7 @@ class SGLangEngine(RayActor):
         """Check whether this engine has received a SIGTERM eviction signal."""
         return self._evicted.is_set()
 
+    @traced("rollout.init.engine", level=2, role="rollout")
     def init(
         self,
         dist_init_addr,
@@ -528,6 +533,7 @@ class SGLangEngine(RayActor):
         skip_dcs_registration: bool = False,
         skip_router_registration: bool = False,
         require_router_registration: bool = False,
+        _trace_context: Optional[dict] = None,
     ) -> dict[str, str | int | None]:
         """Initialize the SGLang engine.
 
@@ -595,6 +601,7 @@ class SGLangEngine(RayActor):
             self.register_dcs()
         return {"url": self.get_url(), **self.get_pid_and_node_id()}
 
+    @traced("rollout.init.register_weights", level=2, role="rollout")
     def register_dcs(self):
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
@@ -643,10 +650,11 @@ class SGLangEngine(RayActor):
             self.register_to_router()
 
     def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
-        if apply_policy_load_plan:
-            if self._is_scaled_out:
-                server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
-            server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+        with stage("rollout.init.checkpoint_prepare", level=2):
+            if apply_policy_load_plan:
+                if self._is_scaled_out:
+                    server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
+                server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
@@ -680,10 +688,13 @@ class SGLangEngine(RayActor):
         if getattr(self.args, "warm_hf_checkpoint_page_cache", False):
             from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 
-            warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
+            with stage("rollout.init.page_cache", level=2):
+                warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        server_args = ServerArgs(**server_args_dict)
+        from relax.utils.tracing_sglang import configure
+
+        server_args = ServerArgs(**configure(server_args_dict))
         self._router_bootstrap_port = (
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
@@ -714,7 +725,25 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {}, timeout=timeout)
+        if endpoint == "update_weights_from_tensor":
+            # Weight chunks repeatedly hit this same server. Reuse connections
+            # and retry only a connection timeout, before any request was sent.
+            # A read timeout/reset or HTTP failure can follow a partial load;
+            # those must propagate without replaying the update.
+            session = getattr(self, "_weight_http_session", None)
+            if session is None:
+                session = self._weight_http_session = requests.Session()
+            for attempt in range(3):
+                try:
+                    response = session.post(url, json=payload or {}, timeout=(10, timeout))
+                    break
+                except ConnectTimeout:
+                    if attempt == 2:
+                        raise
+                    logger.warning("Weight IPC connection timed out; retrying connection (%s/2)", attempt + 1)
+                    time.sleep(attempt + 1)
+        else:
+            response = requests.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -751,6 +780,7 @@ class SGLangEngine(RayActor):
         load_format: str | None = None,
         flush_cache: bool = False,
         weight_version: str | None = None,
+        relax_trace_context: dict | None = None,
     ):
         """Update model weights from tensor data. The HTTP server will only
         post meta data, and the real weights will be copied directly from GPUs.
@@ -760,6 +790,7 @@ class SGLangEngine(RayActor):
         """
         payload = {
             "serialized_named_tensors": serialized_named_tensors,
+            **({"relax_trace_context": relax_trace_context} if relax_trace_context else {}),
             "load_format": load_format,
             "flush_cache": flush_cache,
         }
@@ -1090,6 +1121,7 @@ class SGLangEngine(RayActor):
             pass
         return {"pid": os.getpid(), "node_id": node_id}
 
+    @traced("rollout.init.register_router", level=2, role="rollout")
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
         required = getattr(self, "_require_router_registration", False)
         if self.node_rank != 0:
@@ -1359,10 +1391,12 @@ class SGLangEngine(RayActor):
             pass
 
     def update_weights_from_distributed(
-        self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
+        self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None,
+        relax_trace_context: dict | None = None,
     ):
         payload = {
             "names": names,
+            **({"relax_trace_context": relax_trace_context} if relax_trace_context else {}),
             "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
             "shapes": shapes,
             "group_name": group_name,

@@ -1,0 +1,23 @@
+{
+  "sglang_version": "0.5.17",
+  "source_git_head": "29481685462732237d80d86076d6563e1f658102",
+  "target": "python/sglang/srt/observability/trace.py",
+  "before_sha256": "c162897ddd317db431772fa30957113e96ad0ff46e5f86b622c98ac31b954faf",
+  "after_sha256": "3af336bbd4c6bd7fcf5b806297a2c30e09547a3779d4287f0d1d71d8bf16f0e9",
+  "patch_sha256": "e7c8b2a8a61cab95a5e68afa1299f27b3da16733357426dca60034ff43c838a6",
+  "historical_verified_experiment": 2266400,
+  "validation": "Name-based descriptions; no per-span description injection. Native patch round-trip verified locally; GPU validation pending.",
+  "verified_async_run": {
+    "job_id": 345810,
+    "trial_id": 2262600,
+    "run_name": "ettr-35b-async-10step-descriptions-0b419c2-20261022T121017Z",
+    "main_spans": 4876,
+    "all_run_spans": 5548,
+    "private_overlay": "/tmp/ettr/20261022T121017Z-native"
+  },
+  "previous_gpu_verified_target_sha256": "483907fc2b72cf3bf4c374a7723b8ca73dfd7ff7ab67150de921484a668f996d",
+  "required_relax_modules": [
+    "relax.utils.tracing_shutdown",
+    "relax.utils.tracing_policy"
+  ]
+}

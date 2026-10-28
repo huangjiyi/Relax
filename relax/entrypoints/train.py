@@ -22,6 +22,8 @@ from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.tracing import finish_run, runtime_environment, shutdown_tracing, stage, start_run  # noqa: E402
+from relax.utils.tracing_shutdown_control import finalize_run_traces  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
@@ -72,38 +74,54 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     watchdog.daemon = True
     watchdog.start()
     try:
+        # Signal handlers do not unwind controller.loop before os._exit. Export
+        # observed interruption boundaries before potentially blocking cleanup.
+        reason = signal.Signals(sig).name if sig is not None else f"job_exit_{exit_code or 0}"
+        shutdown_tracing(reason, error=sig is None and bool(exit_code), completed=sig is None and not exit_code)
         sig_name = signal.Signals(sig).name if sig else "atexit"
         logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
+        # Native SGLang owners and Ray actors are separate processes. End their
+        # observation and confirm export before Serve/engine teardown kills them.
+        try:
+            tracing_result = finalize_run_traces(reason, completed=sig is None and not exit_code)
+            if tracing_result.get("enabled"):
+                logger.info(f"Distributed trace finalization verified={tracing_result['verified']}")
+                if not tracing_result["verified"]:
+                    logger.warning("Trace shutdown acknowledgements incomplete; retained in shutdown result.json")
+        except Exception as exc:
+            logger.warning(f"Distributed trace finalization failed: {exc}")
 
         # Detached cache agents are outside the Ray Job's process tree. Notify them
         # first so a short Ray Job SIGTERM grace period cannot prevent publishing;
         # the normal path waits for a final snapshot after Serve stops train actors.
-        if sig is not None and _kernel_cache_heartbeat is not None:
-            try:
-                _kernel_cache_heartbeat.request_finalize(sig_name)
-            except Exception as e:
-                logger.warning(f"Kernel cache finalize request failed during {sig_name}: {e}")
+        with stage("job.shutdown", level=2):
+            if sig is not None and _kernel_cache_heartbeat is not None:
+                try:
+                    _kernel_cache_heartbeat.request_finalize(sig_name)
+                except Exception as e:
+                    logger.warning(f"Kernel cache finalize request failed during {sig_name}: {e}")
 
-        if _ctrl is not None:
-            try:
-                _ctrl.shutdown()
-            except Exception as e:
-                logger.warning(f"Controller shutdown error during {sig_name}: {e}")
+            if _ctrl is not None:
+                try:
+                    _ctrl.shutdown()
+                except Exception as e:
+                    logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
-        if ray.is_initialized():
-            try:
-                serve.shutdown()
-                if _kernel_cache_heartbeat is not None:
-                    results = _kernel_cache_heartbeat.finalize(
-                        sig_name,
-                        timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
-                    )
-                    logger.info(f"Kernel cache agents finalized: {results}")
-                ray.shutdown()
-                logger.info("Ray shutdown successfully")
-            except Exception as e:
-                logger.warning(f"Ray shutdown error during {sig_name}: {e}")
+            if ray.is_initialized():
+                try:
+                    serve.shutdown()
+                    if _kernel_cache_heartbeat is not None:
+                        results = _kernel_cache_heartbeat.finalize(
+                            sig_name,
+                            timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
+                        )
+                        logger.info(f"Kernel cache agents finalized: {results}")
+                    ray.shutdown()
+                    logger.info("Ray shutdown successfully")
+                except Exception as e:
+                    logger.warning(f"Ray shutdown error during {sig_name}: {e}")
 
+        finish_run(error=bool(effective_exit_code))
         if exit_code is not None:
             _hard_exit(exit_code)
     finally:
@@ -119,24 +137,32 @@ def main(args):
     atexit.register(_graceful_shutdown)
 
     try:
+        start_run()
         # Load runtime_env from config so we can both pass it to ray.init and
         # explicitly to the Serve deployment. Ensure it's available even if Ray
         # is already initialized.
-        with open(os.path.join(cur_file_dir, "configs/env.yaml")) as file:
-            runtime_env = yaml.safe_load(file)
+        with stage("job.init.runtime", level=2):
+            with open(os.path.join(cur_file_dir, "configs/env.yaml")) as file:
+                runtime_env = yaml.safe_load(file)
 
-        runtime_env = post_process_env(args, runtime_env)
-        if not ray.is_initialized():
-            # this is for local ray cluster
-            ray.init(runtime_env=runtime_env)
-            logger.info("Ray initialized successfully")
-            try:
-                serve.start(
-                    http_options={"host": "0.0.0.0", "port": "8000"},
-                    detached=True,
-                )
-            except RuntimeError:
-                pass
+            runtime_env = post_process_env(args, runtime_env)
+            runtime_env.setdefault("env_vars", {}).update(runtime_environment())
+            if not ray.is_initialized():
+                # this is for local ray cluster
+                ray.init(runtime_env=runtime_env)
+                # Ray installs its own SIGTERM handler during init. Restore the
+                # owner that closes telemetry before shutting down Ray workers.
+                signal.signal(signal.SIGTERM, _graceful_shutdown)
+                signal.signal(signal.SIGINT, _graceful_shutdown)
+                logger.info("Installed graceful shutdown handlers after Ray initialization")
+                logger.info("Ray initialized successfully")
+                try:
+                    serve.start(
+                        http_options={"host": "0.0.0.0", "port": "8000"},
+                        detached=True,
+                    )
+                except RuntimeError:
+                    pass
 
         if os.environ.get("RELAX_KERNEL_CACHE_DIR"):
             from relax.distributed.ray.kernel_cache import start_kernel_cache_heartbeat_from_env
@@ -146,9 +172,10 @@ def main(args):
         # init_tracking must run after serve.start() (metrics adapter probes Ray
         # Serve for the /metrics endpoint) and before Controller() (wandb primary
         # writes wandb_run_id into args, which then propagates to remote actors).
-        init_tracking(args)
+        with stage("job.init.tracking", level=2):
+            init_tracking(args)
 
-        maybe_pin_baseline_to_stable(args)
+            maybe_pin_baseline_to_stable(args)
 
         # Keep the owner reachable even if initialization fails after creating
         # a teacher, router, or some of the training services.

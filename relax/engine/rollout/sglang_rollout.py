@@ -62,6 +62,7 @@ from relax.utils.score_centering import (
     score_centering_enabled,
 )
 from relax.utils.timer import Timer
+from relax.utils.tracing import request_context, stage, traced
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -347,22 +348,25 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
     return values.reshape(num_rows, values.size // num_rows)
 
 
+@traced("rollout.engine_request", level=3)
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
     router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
     for attempt in range(2):
         if attempt and state.abort_event.is_set():
-            raise GenerationAborted
+            raise GenerationAborted("rollout_abort_before_retry")
         try:
-            return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
+            return await post(
+                url, payload, headers=request_context(headers), fail_fast_no_workers=router_recovery_enabled
+            )
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):
-                raise GenerationAborted from error
+                raise GenerationAborted("sglang_generation_cancelled_http_499") from error
             if not router_recovery_enabled or not is_router_no_available_workers(error):
                 raise
             if state.abort_event.is_set():
-                raise GenerationAborted from error
+                raise GenerationAborted("rollout_abort_during_router_recovery") from error
             if attempt:
                 raise RuntimeError("SGLang router still has no available workers after recovery wait") from error
             wait_s = float(getattr(args, "router_cb_timeout_duration_secs", 60)) + 2
@@ -372,7 +376,7 @@ async def _post_generation(
             except asyncio.TimeoutError:
                 pass
             else:
-                raise GenerationAborted from error
+                raise GenerationAborted("rollout_abort_during_router_recovery_wait") from error
 
 
 async def generate(
@@ -707,6 +711,7 @@ async def _dispatch_generate(
         return sample
 
 
+@traced("rollout.sample", level=3, sample_arg="sample")
 async def generate_and_rm(
     args: Namespace,
     sample: Sample | list[Sample],
@@ -755,7 +760,8 @@ async def generate_and_rm(
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            with stage("rollout.reward", level=3):
+                sample.reward = await async_rm(args, sample)
 
         if state.opd_manager and not evaluation:
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
@@ -794,6 +800,7 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     return metrics
 
 
+@traced("rollout.group", level=3, group_arg="group")
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
@@ -838,7 +845,8 @@ async def generate_and_rm_group(
     group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-        rewards = await batched_async_rm(args, group)
+        with stage("rollout.group_reward", level=3):
+            rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
@@ -1033,14 +1041,15 @@ async def generate_rollout_async(
         while state.remaining_batch_size < submit_target:
             _t_get_samples = monotonic()
 
-            if state.prefetched_samples_ref is not None:
-                ref = state.prefetched_samples_ref
-                state.prefetched_samples_ref = None
-                logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
-            else:
-                ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
+            with stage("rollout.data_fetch", level=2):
+                if state.prefetched_samples_ref is not None:
+                    ref = state.prefetched_samples_ref
+                    state.prefetched_samples_ref = None
+                    logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
+                else:
+                    ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
-            samples = await loop.run_in_executor(None, ray.get, ref)
+                samples = await loop.run_in_executor(None, ray.get, ref)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
@@ -1232,7 +1241,8 @@ async def generate_rollout_async(
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        with stage("rollout.transfer_wait", level=2):
+            await asyncio.gather(*transfer_tasks)
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)

@@ -205,6 +205,20 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- Telemetry / Log -------------
     RELAX_TELEMETRY_HOOK = EnvProperty("RELAX_TELEMETRY_HOOK", str, None)
+    RELAX_OTEL_ENABLED = EnvProperty("RELAX_OTEL_ENABLED", bool, False)
+    RELAX_OTEL_OUTPUT_DIR = EnvProperty("RELAX_OTEL_OUTPUT_DIR", str, None)
+    RELAX_OTEL_SHUTDOWN_DIR = EnvProperty("RELAX_OTEL_SHUTDOWN_DIR", str, None)
+    RELAX_OTEL_RUN_ID = EnvProperty("RELAX_OTEL_RUN_ID", str, None)
+    RELAX_OTEL_TRACEPARENT = EnvProperty("RELAX_OTEL_TRACEPARENT", str, "")
+    RELAX_OTEL_EXPORTER = EnvProperty("RELAX_OTEL_EXPORTER", str, "file")
+    RELAX_OTEL_LEVEL = EnvProperty("RELAX_OTEL_LEVEL", int, 1)
+    RELAX_OTEL_DETAIL_STEPS = EnvProperty("RELAX_OTEL_DETAIL_STEPS", str, "")
+    # Enable only with the matching versioned SGLang lifecycle overlay.
+    RELAX_OTEL_SGLANG_LIFECYCLE = EnvProperty("RELAX_OTEL_SGLANG_LIFECYCLE", bool, False)
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = EnvProperty("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", str, "")
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = EnvProperty("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", str, "http/protobuf")
+    OTEL_RESOURCE_ATTRIBUTES = EnvProperty("OTEL_RESOURCE_ATTRIBUTES", str, "")
+    SGLANG_TRACE_LEVEL = EnvProperty("SGLANG_TRACE_LEVEL", int, 2)
     LOG_LEVEL = EnvProperty("LOG_LEVEL", str, "INFO")
     # Ray's own knob; it accepts "1" and "legacy", so it stays a string rather
     # than a bool to avoid rejecting a value Ray itself considers valid.

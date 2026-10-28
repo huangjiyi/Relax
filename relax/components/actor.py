@@ -22,6 +22,7 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.tracing import stage, traced
 
 
 app = FastAPI()
@@ -51,6 +52,7 @@ class Actor(Base):
     - sync: Waits for rollout data before each training step
     """
 
+    @traced("service.init", role="actor")
     def __init__(
         self,
         healthy: Any,
@@ -72,22 +74,25 @@ class Actor(Base):
         self._stop_event = threading.Event()
         self._loop_runner = BackgroundLoopRunner()
 
-        self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
+        with stage("actor.init.allocate_workers", level=2):
+            self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        with stage("service.init.data_client", level=2):
+            tq.init(self.config.tq_config)
+            self.data_system_client = tq.get_client()
 
-        self.steps = ray.get(
-            self.actor_model.async_init(
-                config,
-                role=self.role,
-                with_ref=(
-                    config.kl_coef != 0
-                    or config.use_kl_loss
-                    or (is_dpo_mode(config) and not config.dpo_reference_free)
-                ),
-                with_opd_teacher=self.config.opd_teacher_load,
-            )
+        with stage("actor.init.workers", level=2):
+            self.steps = ray.get(
+                self.actor_model.async_init(
+                    config,
+                    role=self.role,
+                    with_ref=(
+                        config.kl_coef != 0
+                        or config.use_kl_loss
+                        or (is_dpo_mode(config) and not config.dpo_reference_free)
+                    ),
+                    with_opd_teacher=self.config.opd_teacher_load,
+                )
         )
 
         assert len(set(self.steps)) == 1
@@ -111,7 +116,8 @@ class Actor(Base):
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
-    def set_rollout_manager(self, rollout_manager: Any) -> None:
+    @traced("actor.configure_rollout", role="actor")
+    def set_rollout_manager(self, rollout_manager: Any, *, _trace_context: Optional[dict] = None) -> None:
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
@@ -155,10 +161,14 @@ class Actor(Base):
         set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
-    def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
+    @traced("weights.initialize", role="actor")
+    def update_weights_fully_async(
+        self, rollout_only: bool = False, actor_fwd_only: bool = False, *, _trace_context: Optional[dict] = None
+    ) -> None:
         self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
 
-    async def run(self) -> None:
+    @traced("service.run", role="actor")
+    async def run(self, *, _trace_context: Optional[dict] = None) -> None:
         await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
 
     def _reset_consumption(self) -> None:
@@ -197,19 +207,20 @@ class Actor(Base):
 
                 self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
 
-                if did_train:
-                    for partition_id in sft_partition_ids(self.config, local_step):
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                    self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
+                with stage("train.service_finalize", level=2, **{"relax.step": local_step}):
+                    if did_train:
+                        for partition_id in sft_partition_ids(self.config, local_step):
+                            run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
-                try:
-                    self.healthy.update_heartbeat.remote("actor", local_step + 1)
-                except Exception:
-                    pass
+                    try:
+                        self.healthy.update_heartbeat.remote("actor", local_step + 1)
+                    except Exception:
+                        pass
 
-                # increment step with lock
-                with self._lock:
-                    self.step += 1
+                    # increment step with lock
+                    with self._lock:
+                        self.step += 1
 
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
@@ -218,6 +229,7 @@ class Actor(Base):
             if not getattr(self.config, "use_health_check", False):
                 raise
 
+    @traced("train.wait_rollout", role="actor", level=2)
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.
 
@@ -239,7 +251,8 @@ class Actor(Base):
         if is_offline_mode(self.config):
             return True
         if self.config.offload_rollout and self._rollout_barrier is not None:
-            self._rollout_barrier.wait_offloaded_sync()
+            with stage("train.wait_rollout_offload", level=2):
+                self._rollout_barrier.wait_offloaded_sync()
 
         # PPO colocate: also block until critic has finished this round
         # (sleep + step increment) so critic's resident weights are off the
@@ -250,10 +263,12 @@ class Actor(Base):
             and not self._peer_barrier.is_empty()
             and self.step >= getattr(self.config, "num_critic_only_steps", 0)
         ):
-            self._peer_barrier.wait_completed_round_sync(self.step)
+            with stage("train.wait_peer", level=2):
+                self._peer_barrier.wait_completed_round_sync(self.step)
 
         return True
 
+    @traced("train.step", role="actor")
     def _execute_training(self) -> bool:
         """Execute training for the current step.
 
@@ -281,7 +296,8 @@ class Actor(Base):
                 # update_weights, otherwise SGLang onload collides with
                 # critic still training on the same GPUs.
                 if self._peer_barrier is not None:
-                    self._peer_barrier.wait_completed_round_sync(self.step)
+                    with stage("train.wait_peer", level=2):
+                        self._peer_barrier.wait_completed_round_sync(self.step)
                 self.actor_model.update_weights()
             return False
 

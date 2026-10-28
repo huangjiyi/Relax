@@ -62,5 +62,5 @@ class InferencePermitManager:
         """
         async with self.semaphore:
             if abort_check is not None and abort_check():
-                raise GenerationAborted()
+                raise GenerationAborted("rollout_abort_before_dispatch")
             yield

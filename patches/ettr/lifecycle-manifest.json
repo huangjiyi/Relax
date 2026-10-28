@@ -1,0 +1,29 @@
+{
+  "base": "SGLang 0.5.17 deployment source snapshot from Trial 2262600",
+  "patch": "sglang-v0.5.17-lifecycle.patch",
+  "patch_sha256": "099c6d839c665c8cb6b6815397d76cb42f8ba874687b57814bb26019e35db206",
+  "requires": "sglang-v0.5.17-ettr.patch from the same package",
+  "files": [
+    {
+      "target": "python/sglang/srt/managers/io_struct.py",
+      "before_sha256": "300f2efd990fd622210fb58c1cf12f2e3c6c341195b7e2b5fe5b1652c5c48f67",
+      "after_sha256": "990b4cd7fa7efebefdcdd9bbd24825b8153c80236445b958546b1f666e267dea"
+    },
+    {
+      "target": "python/sglang/srt/managers/scheduler.py",
+      "before_sha256": "a31be9152e944bca4754a59e24b5429b3aed8ee76380dc584ce86179544755a7",
+      "after_sha256": "a6042008c82b2c5ecb4f0ac01f6e82742deadc6c82cb16ed323f8a4a4637b2d3"
+    },
+    {
+      "target": "python/sglang/srt/model_executor/model_runner.py",
+      "before_sha256": "b41ea1b5ff1ccdad4bdd00badc8698a7f641c758bb4c059f43ba5614a9b8a81a",
+      "after_sha256": "dc18e09c9b6cd018c82ff26655e7c01dddb41009057de522bd7eda754ae7b0a2"
+    },
+    {
+      "target": "python/sglang/srt/managers/scheduler_components/weight_updater.py",
+      "before_sha256": "dfb892df0c5c7990dd28c8897aeed5cd4a8845e775ce8d688c7d32ea8663dcd5",
+      "after_sha256": "d33e95619a2b7560cdad8cb8b010bd8c55eb1810653b609dec6c72438500b63b"
+    }
+  ],
+  "validation": "Local: 58 CPU tests passed, including patched distributed/tensor handlers with CPU stubs; five native targets passed hash, patch round-trip and syntax checks. Lifecycle extension not deployed or GPU validated. Historical verified_async_run applies only to previous_gpu_verified_target_sha256."
+}

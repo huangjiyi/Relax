@@ -4,11 +4,13 @@
 
 import ast
 import concurrent.futures
+import contextvars
 import os
 import signal
 import subprocess
 import sys
 import threading
+from contextlib import nullcontext
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def _load_definitions(path, names, namespace):
     # These orchestration functions only need mocked service APIs. Avoid importing
     # CUDA/Megatron dependencies just to exercise their actual control flow.
+    namespace.setdefault("traced", lambda *args, **kwargs: lambda fn: fn)
+    namespace.setdefault("child_runtime_environment", lambda env: env)
     tree = ast.parse((ROOT / path).read_text())
     tree.body = [
         node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
@@ -54,6 +58,12 @@ def _train_namespace():
         "_kernel_cache_heartbeat": None,
         "_SHUTDOWN_TIMEOUT_SEC": 60,
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
+        "start_run": Mock(),
+        "finish_run": Mock(),
+        "shutdown_tracing": Mock(),
+        "finalize_run_traces": Mock(return_value={"enabled": False}),
+        "runtime_environment": lambda: {},
+        "stage": lambda *args, **kwargs: nullcontext(),
     }
     return _load_definitions("relax/entrypoints/train.py", {"main", "_hard_exit", "_graceful_shutdown"}, namespace)
 
@@ -113,6 +123,28 @@ def test_train_cleans_up_if_tracking_fails_before_controller(monkeypatch):
     assert events == ["serve", "ray", ("exit", 1)]
 
 
+def test_train_restores_handler_overwritten_by_ray_init(monkeypatch):
+    monkeypatch.delenv("RELAX_KERNEL_CACHE_DIR", raising=False)
+    ns = _train_namespace()
+    installed = {}
+    ns["signal"].signal.side_effect = lambda sig, handler: installed.__setitem__(sig, handler)
+    ns["ray"].is_initialized.return_value = False
+    ns["ray"].init.side_effect = lambda **kwargs: installed.__setitem__(signal.SIGTERM, "ray-handler")
+
+    class Controller:
+        def __init__(self, *args):
+            assert installed[signal.SIGTERM] is ns["_graceful_shutdown"]
+        def training_loop(self):
+            pass
+        def shutdown(self):
+            pass
+
+    ns["Controller"] = Controller
+    ns["_hard_exit"] = Mock()
+    ns["main"](SimpleNamespace())
+    ns["finalize_run_traces"].assert_called_once_with("job_exit_0", completed=True)
+
+
 @pytest.mark.parametrize("hang_at", ["serve", "controller"])
 @pytest.mark.parametrize("exit_code", [0, 1, 143])
 def test_train_shutdown_deadline_exits_blocked_process(hang_at, exit_code):
@@ -153,6 +185,7 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "concurrent": SimpleNamespace(futures=concurrent.futures),
+        "contextvars": contextvars,
         "threading": threading,
         "logger": Mock(),
         "serve": Mock(),
@@ -395,6 +428,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     )
     stop_teacher = Mock()
     ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
+    ns["traced"] = lambda *args, **kwargs: lambda fn: fn
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
@@ -402,6 +436,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         _teacher_manager=teacher,
         _shutdown_agentic_rollout_services=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
+        _finalize_service_traces=Mock(),
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     ns["shutdown"](partial_controller)

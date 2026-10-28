@@ -18,10 +18,11 @@ def module():
     return update_weight_from_tensor
 
 
+@pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("failure", [False, True, "exception"])
-def test_routed_ipc_wait_checks_receiver_results(module, failure):
+def test_routed_ipc_wait_checks_receiver_results(module, failure, routed):
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = True
+    updater._route_experts = routed
     group = object()
     get = (
         Mock(side_effect=RuntimeError("RPC failed"))
@@ -40,7 +41,7 @@ def test_routed_ipc_wait_checks_receiver_results(module, failure):
         patch.object(module.dist, "all_gather_object", side_effect=collect),
     ):
         if failure:
-            with pytest.raises(RuntimeError, match="Routed weight load failed"):
+            with pytest.raises(RuntimeError, match="Weight load failed"):
                 updater._wait_for_ipc([object()])
         else:
             updater._wait_for_ipc([object()])
@@ -48,9 +49,10 @@ def test_routed_ipc_wait_checks_receiver_results(module, failure):
         assert reduce.call_args.args[0].device.type == "cpu"
 
 
-def test_routed_ipc_empty_rank_propagates_peer_failure(module):
+@pytest.mark.parametrize("routed", [False, True])
+def test_routed_ipc_empty_rank_propagates_peer_failure(module, routed):
     updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = True
+    updater._route_experts = routed
     with (
         patch.object(module.ray, "get") as get,
         patch.object(module, "get_gloo_group"),
@@ -63,17 +65,6 @@ def test_routed_ipc_empty_rank_propagates_peer_failure(module):
         with pytest.raises(RuntimeError, match="bad load"):
             updater._wait_for_ipc([])
         get.assert_not_called()
-
-
-def test_legacy_ipc_wait_does_not_add_collectives(module):
-    updater = object.__new__(module.UpdateWeightFromTensor)
-    updater._route_experts = False
-    with patch.object(module.ray, "get") as get, patch.object(module.dist, "all_reduce") as reduce:
-        updater._wait_for_ipc([])
-        get.assert_not_called()
-        updater._wait_for_ipc(["ref"])
-        get.assert_called_once_with(["ref"])
-        reduce.assert_not_called()
 
 
 @pytest.mark.parametrize("fail_load", [False, True, "conversion", "dispatch"])
@@ -134,7 +125,7 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load)
         if fail_load:
             with pytest.raises(
                 RuntimeError,
-                match="next conversion failed" if fail_load == "conversion" else "Routed weight load failed",
+                match="next conversion failed" if fail_load == "conversion" else "Weight load failed",
             ):
                 updater.update_weights()
             assert sum(name == "send" for name, _ in events) == 1
@@ -244,3 +235,99 @@ def test_routed_ipc_dispatch_failure_preserves_submitted_readers(module, success
     assert refs == ["reader"] * successful_dispatches
     assert len(buffers) == 2
     assert errors == ["dispatch failed"]
+
+
+def test_pipelined_failure_drains_current_reader_before_releasing_buffer(module):
+    from types import SimpleNamespace
+    import weakref
+
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._route_experts = False
+    updater.lora_enabled = updater.lora_merge_mode = False
+    updater.quantization_config = None
+    updater.rollout_engines, updater.distributed_rollout_engines = [], []
+    updater.weight_version = 0
+    updater.weights_getter = lambda: {}
+    updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=lambda _: iter([[], [], []]))
+    buffers, reads = [], []
+
+    class Buffer:
+        pass
+
+    def send(tensors, *, dispatch_errors=None):
+        buffer = Buffer()
+        buffers.append(weakref.ref(buffer))
+        return [len(buffers) - 1], buffer
+
+    def get(refs):
+        if refs == []:
+            return []
+        index = refs[0] if isinstance(refs, list) else refs
+        assert buffers[index]() is not None, "IPC buffer freed while reader is active"
+        reads.append(index)
+        if index == 0:
+            raise RuntimeError("original connection timeout")
+        return [{"success": True}]
+
+    updater._send_hf_params = send
+    with (
+        patch.object(module.ray, "get", side_effect=get),
+        patch.object(module.dist, "get_rank", return_value=0),
+        patch.object(module.dist, "all_reduce"),
+        patch.object(module.dist, "barrier"),
+        patch.object(module.dist, "get_world_size", return_value=1),
+        patch.object(module.dist, "all_gather_object", side_effect=lambda out, local, **kw: out.__setitem__(0, local)),
+        patch.object(module, "get_gloo_group"),
+        patch.object(module.device_utils, "maybe_backend_barrier_on_weight_chunk"),
+    ):
+        with pytest.raises(RuntimeError, match="original connection timeout"):
+            updater.update_weights()
+    assert len(buffers) == 2
+    assert reads == [0, 0, 1]
+
+
+def _ipc_gloo_worker(rank, rendezvous, output, fail):
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+    import torch.distributed as dist
+    from relax.backends.megatron.weight_update import update_weight_from_tensor as module
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._route_experts = False
+    reached_next_chunk = False
+    error = None
+    try:
+        def get(refs):
+            if fail:
+                raise RuntimeError("rank0 injected connection timeout")
+            return [{"success": True}]
+
+        with patch.object(module.ray, "get", side_effect=get), patch.object(module, "get_gloo_group", return_value=dist.group.WORLD):
+            updater._wait_for_ipc(["reader"] if rank == 0 else [])
+            reached_next_chunk = True
+    except RuntimeError as exc:
+        error = str(exc)
+    finally:
+        Path(output, f"{rank}.json").write_text(json.dumps({"next_chunk": reached_next_chunk, "error": error}))
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_nonrouted_two_rank_gloo_agrees_before_next_chunk(module, tmp_path, fail):
+    import json
+    import time
+    import torch.multiprocessing as mp
+
+    context = mp.spawn(_ipc_gloo_worker, args=(f"file://{tmp_path}/rendezvous", str(tmp_path), fail), nprocs=2, join=False)
+    deadline = time.monotonic() + 60
+    while not context.join(timeout=1):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                process.terminate()
+            pytest.fail("IPC failure consensus hung")
+    results = [json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2)]
+    assert all(result["next_chunk"] is (not fail) for result in results)
+    if fail:
+        assert all("rank0 injected connection timeout" in result["error"] for result in results)

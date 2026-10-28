@@ -23,6 +23,7 @@ from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, 
 from relax.distributed.checkpoint_service.metrics import MetricsCollector
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
+from relax.utils.tracing import stage
 
 
 logger = get_logger(__name__)
@@ -284,13 +285,15 @@ class CheckpointEngineClient:
     async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
         """Update rollout weights; rank 0 returns the actual recipient Actor
         IDs."""
-        response = await self._http_client.get(f"{self.coordinator_url}/topology")
-        response.raise_for_status()
-        data = response.json()
-        logger.info(f"get topology: {data}")
-        if not actor_fwd_only:
-            self._backend.init_process_group_for_rollout(data)
-        self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
+        with stage("weights.connect", level=2):
+            response = await self._http_client.get(f"{self.coordinator_url}/topology")
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"get topology: {data}")
+            if not actor_fwd_only:
+                self._backend.init_process_group_for_rollout(data)
+        with stage("weights.transfer_apply", level=2):
+            self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
         # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
         if actor_fwd_only or self._backend._lora_adapter_mode:

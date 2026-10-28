@@ -16,6 +16,7 @@ from relax.distributed.ray.placement_group import (
     create_placement_group,
 )
 from relax.utils.logging_utils import get_logger
+from relax.utils.tracing import child_runtime_environment, remote_context, traced
 from relax.utils.utils import get_serve_url, recovery_load_path
 
 
@@ -26,6 +27,7 @@ logger = get_logger(__name__)
 
 
 class Service:
+    @traced("service.allocate", level=2)
     def __init__(
         self,
         cls: Any,
@@ -112,6 +114,7 @@ class Service:
         else:
             self.pgs = None
 
+    @traced("service.deploy", level=2)
     def _deploy(self, pgs: Optional[Any] = None) -> None:
         """Bind and deploy the Ray Serve deployment with the given placement
         group.
@@ -121,7 +124,7 @@ class Service:
         """
         ray_actor_options = with_control_plane_affinity(
             self.config,
-            {"runtime_env": self.runtime_env},
+            {"runtime_env": child_runtime_environment(self.runtime_env)},
         )
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
@@ -201,11 +204,13 @@ class Service:
         """
         self.healthy.set_task_status.remote(self.role, True)
         self._start_heartbeat()
-        self._task_ref = self.handle.run.remote()
+        context = remote_context() if str(self.role) in {"actor", "rollout"} else {}
+        self._task_ref = self.handle.run.remote(**context)
         return self._task_ref
 
     async def set_rollout_manager(self, rollout_manager: Any) -> None:
-        await self.handle.set_rollout_manager.remote(rollout_manager)
+        context = remote_context() if str(self.role) == "actor" else {}
+        await self.handle.set_rollout_manager.remote(rollout_manager, **context)
 
     async def get_rollout_manager(self) -> Any:
         return await self.handle.get_rollout_manager.remote()
@@ -237,7 +242,9 @@ class Service:
 
     async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
         """Trigger a fully asynchronous weight update for Actor service."""
-        return self.handle.update_weights_fully_async.remote(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        return self.handle.update_weights_fully_async.remote(
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, **remote_context()
+        )
 
     async def recv_weight_fully_async(self):
         """Trigger a fully asynchronous weight receive for Actor FWD

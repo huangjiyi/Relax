@@ -4,6 +4,7 @@
 dependencies."""
 
 import asyncio
+import contextvars
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -34,10 +35,11 @@ class BackgroundLoopRunner:
                 before_start()
             loop = asyncio.get_running_loop()
             state = _RunState()
+            context = contextvars.copy_context()
 
             def thread_target() -> None:
                 try:
-                    target()
+                    context.run(target)
                 except Exception as exc:
                     state.error = exc
                 finally:

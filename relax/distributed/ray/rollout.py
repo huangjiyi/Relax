@@ -61,6 +61,7 @@ from relax.utils.s3_model_loader import (
     prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
+from relax.utils.tracing import remote_context, traced
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -525,6 +526,7 @@ class EngineGroup:
             # Match _compute_server_args: group overrides win over allocation.
             engine_addr = addr_and_ports[rank] | self.sglang_overrides
             init_ref = engine.init.remote(
+                **(remote_context() if not getattr(self.args, "rollout_engine_class_path", None) else {}),
                 **(addr_and_ports[rank]),
                 router_ip=self.router_ip,
                 router_port=self.router_port,
@@ -906,7 +908,8 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None):
+    @traced("rollout.init.manager", level=2, role="rollout")
+    def __init__(self, args, pg, data_source=None, *, _trace_context=None):
         self.pg = pg
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
@@ -1157,7 +1160,8 @@ class RolloutManager(ReloadableMixin):
         assert self.args.rollout_global_dataset
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
-    async def generate(self, rollout_id):
+    @traced("rollout.generate", role="rollout", step_arg="rollout_id")
+    async def generate(self, rollout_id, *, _trace_context: Optional[dict] = None):
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -2241,6 +2245,7 @@ class RolloutManager(ReloadableMixin):
                 per_engine_timeout = min(request.timeout_secs, 300)
                 try:
                     init_handle = engine.init.remote(
+                        **(remote_context() if not getattr(self.args, "rollout_engine_class_path", None) else {}),
                         dist_init_addr=addr,
                         port=port,
                         nccl_port=None,
@@ -4918,6 +4923,7 @@ def _rollback_rollout_startup(groups: list[EngineGroup], routers_before: tuple) 
         _LAUNCHED_ROUTER_PROCESSES = previous + _LAUNCHED_ROUTER_PROCESSES
 
 
+@traced("rollout.init.servers", level=2)
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start the deployment atomically, retaining ownership on failure."""
     groups: list[EngineGroup] = []

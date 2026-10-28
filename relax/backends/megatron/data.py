@@ -25,6 +25,7 @@ from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
+from relax.utils.tracing import traced
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
@@ -404,6 +405,7 @@ def _build_allgather_thd_metadata(
     return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
 
 
+@traced("data.get_batch", level=3)
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],

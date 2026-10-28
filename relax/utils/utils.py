@@ -18,6 +18,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.tracing import traced
 from relax.utils.types import Sample
 
 
@@ -564,6 +565,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     return convert_samples_to_train_data(args, selected_rows)
 
 
+@traced("rollout.transfer", level=2, step_arg="rollout_id")
 async def transfer_batch_to_data_system(
     args: Namespace,
     batch_samples: List,

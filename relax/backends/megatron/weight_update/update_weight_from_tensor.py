@@ -26,6 +26,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.tracing import traced, weight_context
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .expert_routing import ExpertLayout, validate_server_layout
@@ -102,6 +103,7 @@ class UpdateWeightFromTensor:
         self._model_update_groups = None
         self.distributed_rollout_engines: list[ActorHandle] = []
 
+    @traced("weights.connect", level=2)
     def connect_rollout_engines(
         self,
         rollout_engines: Sequence[ActorHandle],
@@ -231,6 +233,7 @@ class UpdateWeightFromTensor:
                 self._ipc_engine = engine
 
     @torch.no_grad()
+    @traced("weights.transfer_apply", level=2)
     def update_weights(self) -> None:
         """version++, flush caches, process buckets with pipelining.
 
@@ -312,17 +315,25 @@ class UpdateWeightFromTensor:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
                 dispatch_errors = []
                 refs, long_lived_tensors = self._send_hf_params(
-                    hf_named_tensors, dispatch_errors=dispatch_errors if self._route_experts else None
+                    hf_named_tensors, dispatch_errors=dispatch_errors
                 )
                 # Wait for the *previous* chunk's IPC to finish before
                 # releasing its GPU tensors.
                 # Routed chunks can fail collectively while producing the next
                 # bucket. Complete their IPC before advancing the generator so
                 # an error cannot release a buffer still read by SGLang.
-                self._wait_for_ipc(
-                    refs if self._route_experts else prev_refs,
-                    error="; ".join(dispatch_errors) or None,
-                )
+                try:
+                    self._wait_for_ipc(
+                        refs if self._route_experts else prev_refs,
+                        error="; ".join(dispatch_errors) or None,
+                    )
+                except Exception:
+                    # A pipelined current chunk may still read its IPC buffers
+                    # after the previous chunk fails. Every rank drains it
+                    # before unwinding and releasing either chunk's storage.
+                    if not self._route_experts:
+                        self._wait_for_ipc(refs)
+                    raise
                 del prev_long_lived_tensors
                 prev_refs = [] if self._route_experts else refs
                 prev_long_lived_tensors = None if self._route_experts else long_lived_tensors
@@ -372,15 +383,11 @@ class UpdateWeightFromTensor:
         self._wait_for_ipc(refs, error=error)
 
     def _wait_for_ipc(self, refs: list[ObjectRef], *, error: str | None = None) -> None:
-        if not self._route_experts:
-            if refs:
-                ray.get(refs)
-            return
         try:
             results = ray.get(refs) if refs else []
             for result in results:
                 if isinstance(result, Mapping) and result.get("success") is False:
-                    raise RuntimeError(f"SGLang rejected routed weights: {result}")
+                    raise RuntimeError(f"SGLang rejected weights: {result}")
         except Exception as exc:
             error = str(exc)
             # ray.get(list) may raise before other requests finish. Keep source
@@ -397,7 +404,7 @@ class UpdateWeightFromTensor:
         if failed.item():
             errors = [None] * dist.get_world_size(get_gloo_group())
             dist.all_gather_object(errors, error, group=get_gloo_group())
-            raise RuntimeError(f"Routed weight load failed: {errors}")
+            raise RuntimeError(f"Weight load failed: {errors}")
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -769,7 +776,7 @@ def _send_to_colocated_engine(
             if weight_version is not None:
                 kwargs["weight_version"] = str(weight_version)
             try:
-                refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
+                refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs, **weight_context()))
             except Exception as exc:
                 if dispatch_errors is None:
                     raise

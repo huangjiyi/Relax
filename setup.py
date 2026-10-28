@@ -1,8 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from setuptools import find_packages, setup
-
 import versioneer
+from setuptools import find_packages, setup
 
 
 def get_requires():
@@ -25,6 +24,11 @@ extra_require = {
     "sglang": [],
     "mcore": [],
     "transferqueue": [],
+    "otel": [
+        "opentelemetry-api>=1.44,<2",
+        "opentelemetry-sdk>=1.44,<2",
+        "opentelemetry-exporter-otlp>=1.44,<2",
+    ],
 }
 
 

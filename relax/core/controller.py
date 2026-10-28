@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 import asyncio
 import concurrent.futures
+import contextvars
 import copy
 import os
 import threading
@@ -51,6 +52,7 @@ from relax.utils.s3_model_loader import (
     read_s3_model_config,
     remove_stale_s3_model_caches,
 )
+from relax.utils.tracing import capture_run_configuration, stage, traced
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -171,8 +173,9 @@ class Controller:
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
-        require_control_plane_resource(config)
-        self._health_manager = HealthManager(check_interval=1.0, config=config)
+        with stage("controller.init.health", level=2):
+            require_control_plane_resource(config)
+            self._health_manager = HealthManager(check_interval=1.0, config=config)
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
         # Keep the synchronization object stable across the self.__init__ call
@@ -208,9 +211,10 @@ class Controller:
 
         # Initialize data management system
         self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment(
-            ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
-        )
+        with stage("controller.init.checkpoint_service", level=2):
+            self.dcs, self.config.coordinator_url = create_dcs_deployment(
+                ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
+            )
 
         self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
         if self._metrics_service_enabled:
@@ -309,6 +313,7 @@ class Controller:
             f"removed_files={removed_files}, removed_bytes={removed_bytes}"
         )
 
+    @traced("controller.init.data_system", level=2)
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
@@ -564,7 +569,7 @@ class Controller:
             if self.config.fully_async:
                 logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args))
-                futures = {executor.submit(task, *args): args[0] for args in task_args}
+                futures = {executor.submit(contextvars.copy_context().run, task, *args): args[0] for args in task_args}
             else:
                 logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
                 futures = {}
@@ -933,6 +938,11 @@ class Controller:
         relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
+        capture_run_configuration(
+            self.config,
+            {str(role): num_gpus for role, _cls, num_gpus, _ds in roles_to_create},
+            actor_rollout_pg_roles if colocate and not self.config.hybrid else [],
+        )
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
 
         if colocate and not self.config.hybrid:
@@ -1005,6 +1015,7 @@ class Controller:
             return
         shutdown_agentic_chat_api_services()
 
+    @traced("controller.loop", role="controller")
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
@@ -1152,6 +1163,27 @@ class Controller:
             logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
             return False
 
+    def _finalize_service_traces(self) -> None:
+        """Bounded telemetry-only RPCs; do not change service work or cancellation."""
+        if Envs.RELAX_OTEL_ENABLED:
+            # Dispatch all services before waiting. An unreachable replica must
+            # not prevent the existing teardown, nor hide a failed flush.
+            responses = []
+            for role, service in getattr(self, "serve_dict", {}).items():
+                try:
+                    if getattr(service, "handle", None) is not None:
+                        responses.append((role, service.handle.finish_tracing.remote("controller_shutdown")))
+                except Exception as exc:
+                    logger.warning(f"Trace finalization dispatch failed for {role}: {exc}")
+            deadline = time.monotonic() + 5
+            for role, response in responses:
+                try:
+                    if not response.result(timeout_s=max(0, deadline - time.monotonic())):
+                        logger.warning(f"Trace finalization did not flush all spans for {role}")
+                except Exception as exc:
+                    logger.warning(f"Trace finalization incomplete for {role}: {exc}")
+
+    @traced("controller.shutdown", level=2)
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1161,6 +1193,7 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
+        self._finalize_service_traces()
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 

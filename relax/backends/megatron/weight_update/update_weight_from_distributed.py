@@ -16,6 +16,7 @@ from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
+from relax.utils.tracing import weight_context
 
 from ..weight_conversion import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
@@ -363,6 +364,7 @@ def update_weights_from_distributed(
             shapes=[param.shape for _, param in converted_named_tensors],
             group_name=group_name,
             weight_version=str(weight_version),
+            **weight_context(),
         )
         for engine in rollout_engines
     ]

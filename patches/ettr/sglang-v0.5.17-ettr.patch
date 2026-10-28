@@ -1,0 +1,540 @@
+--- a/python/sglang/srt/observability/trace.py
++++ b/python/sglang/srt/observability/trace.py
+@@ -15,9 +15,12 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ import os
+ import random
++import secrets
++import sys
+ import threading
+ import time
+ import uuid
+@@ -31,6 +34,12 @@
+ opentelemetry_initialized = False
+ _trace_context_propagator = None
+ tracer: Optional[trace.Tracer] = None
++_active_span_processor = None
++
++
++def _tracing_stopped():
++    return _active_span_processor is not None and _active_span_processor.closing is not None
++
+ 
+ 
+ # Modules allowed to emit spans (from --trace-modules); None means no filtering.
+@@ -121,6 +130,7 @@
+     thread_info: TraceThreadInfo
+     cur_slice_stack: Optional[List[TraceSliceContext]] = None
+     thread_span: Optional[trace.span.Span] = None
++    thread_attrs: Optional[Dict[str, Any]] = None
+ 
+ 
+ class TraceCustomIdGenerator(id_generator.IdGenerator):
+@@ -135,14 +145,32 @@
+         self.local_random.seed(time.time())
+ 
+     def generate_trace_id(self) -> int:
++        if os.environ.get("RELAX_OTEL_ENABLED") == "1":
++            return secrets.randbits(128) or self.generate_trace_id()
+         return self.local_random.getrandbits(64)
+ 
+     def generate_span_id(self) -> int:
++        if os.environ.get("RELAX_OTEL_ENABLED") == "1":
++            return secrets.randbits(64) or self.generate_span_id()
+         return self.local_random.getrandbits(64)
+ 
+ 
+ # global variables
+ threads_info: Dict[int, TraceThreadInfo] = {}
++_worker_metadata_emitted = set()
++
++
++def _code_attributes():
++    if os.environ.get("RELAX_OTEL_ENABLED") != "1":
++        return {}
++    from relax.utils.tracing_code import caller_location
++
++    return caller_location()
++
++
++def _ettr_enabled():
++    return os.environ.get("RELAX_OTEL_ENABLED", "").strip().lower() in ("1", "true", "on", "yes")
++
+ 
+ get_cur_time_ns = lambda: int(time.time() * 1e9)
+ if hasattr(time, "time_ns"):
+@@ -176,6 +204,7 @@
+     global opentelemetry_initialized
+     global get_cur_time_ns
+     global tracer
++    global _active_span_processor
+     global global_trace_modules
+ 
+     if trace_modules is not None:
+@@ -206,12 +235,26 @@
+             "SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", 64
+         )
+ 
++        span_exporter = get_otlp_span_exporter(otlp_endpoint)
++        if os.environ.get("RELAX_OTEL_ENABLED", "").strip().lower() in ("1", "true", "on", "yes"):
++            from relax.utils.tracing_otlp import isolate_exporter_rng
++            from relax.utils.tracing_shutdown import track_active_spans
++
++            _active_span_processor = track_active_spans(tracer_provider)
++            span_exporter = isolate_exporter_rng(span_exporter)
+         processor = BatchSpanProcessor(
+-            span_exporter=get_otlp_span_exporter(otlp_endpoint),
++            span_exporter=span_exporter,
+             schedule_delay_millis=schedule_delay_millis,
+             max_export_batch_size=max_export_batch_size,
+         )
+-        tracer_provider.add_span_processor(processor)
++        if _ettr_enabled():
++            from relax.utils.tracing_policy import CollectionProcessor
++
++            collection = CollectionProcessor()
++            collection.add_span_processor(processor)
++            tracer_provider.add_span_processor(collection)
++        else:
++            tracer_provider.add_span_processor(processor)
+         trace.set_tracer_provider(tracer_provider)
+     except Exception as e:
+         opentelemetry_initialized = False
+@@ -224,7 +267,7 @@
+ 
+ 
+ def get_global_tracing_enabled():
+-    return opentelemetry_initialized
++    return opentelemetry_initialized and not _tracing_stopped()
+ 
+ 
+ def get_otlp_span_exporter(endpoint):
+@@ -278,7 +321,7 @@
+     ):
+         self.rid: str = str(rid)
+         self.trace_level = get_global_trace_level()
+-        self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
++        self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0 and not _tracing_stopped()
+ 
+         # Filter by --trace-modules only for explicitly named modules; contexts
+         # created with the default empty module_name are always traced.
+@@ -289,7 +332,7 @@
+         ):
+             self.tracing_enable = False
+ 
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         self.start_time_ns: Optional[int] = None
+@@ -312,7 +355,7 @@
+         self.pid: int = threading.get_native_id()
+ 
+     def is_tracing_enabled(self) -> bool:
+-        return self.tracing_enable
++        return self.tracing_enable and not _tracing_stopped()
+ 
+     def __create_thread_context(self, ts: int):
+         if self.pid not in threads_info:
+@@ -332,11 +375,17 @@
+         if thread_info.dp_rank is not None:
+             thread_name += f" [DP {thread_info.dp_rank}] "
+         thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+-        thread_context.thread_span = tracer.start_span(
+-            name=thread_name,
+-            start_time=ts,
+-            context=self.root_span_context,
+-        )
++        flat_scheduler = (
++            _ettr_enabled()
++            and thread_info.thread_label in ("Scheduler", "Tokenizer")
++        )
++        if not flat_scheduler:
++            thread_context.thread_span = tracer.start_span(
++                name=thread_name,
++                start_time=ts,
++                context=self.root_span_context,
++                attributes=_code_attributes(),
++            )
+ 
+         rank_attrs = {}
+         if thread_info.tp_rank is not None:
+@@ -345,24 +394,34 @@
+             rank_attrs["pp_rank"] = thread_info.pp_rank
+         if thread_info.dp_rank is not None:
+             rank_attrs["dp_rank"] = thread_info.dp_rank
+-        if rank_attrs:
++        if rank_attrs and thread_context.thread_span:
+             thread_context.thread_span.set_attributes(rank_attrs)
+ 
+-        thread_context.thread_span.set_attributes(
+-            {
+-                "host_id": thread_info.host_id,
+-                "pid": thread_info.pid,
+-                "thread_label": thread_info.thread_label,
+-            }
+-        )
++        identity = {"host_id": thread_info.host_id, "pid": thread_info.pid,
++                    "thread_label": thread_info.thread_label}
++        if flat_scheduler:
++            thread_context.thread_attrs = {**identity, **rank_attrs}
++        if _ettr_enabled() and thread_info.thread_label == "Scheduler":
++            from relax.utils.tracing_topology import capture_sglang_topology
++            from relax.utils.tracing_policy import register_native_metadata
++
++            topology = getattr(thread_info, "_relax_topology", None)
++            if topology is None:
++                topology = capture_sglang_topology()
++                if topology.get("relax.topology.status") == "complete":
++                    thread_info._relax_topology = topology
++            register_native_metadata(topology)
++
++        if thread_context.thread_span:
++            thread_context.thread_span.set_attributes(identity)
+ 
+         return thread_context
+ 
+     def __getstate__(self) -> Optional[Dict[str, Any]]:
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return {"tracing_enable": False}
+ 
+-        if not self.root_span_context:
++        if self.root_span_context is None:
+             return {"tracing_enable": False}
+ 
+         state = {
+@@ -402,7 +461,7 @@
+         self.__dict__.update(state)
+         if not opentelemetry_initialized:
+             self.tracing_enable = False
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         self.is_copy = True
+@@ -433,7 +492,7 @@
+             kv_chunk.trace_ctx.rebuild_thread_context()
+         """
+         # Fast path: not tracing
+-        if not self.tracing_enable or not self.root_span_context:
++        if not self.tracing_enable or _tracing_stopped() or self.root_span_context is None:
+             return TraceNullContext()
+ 
+         # Extract prev_span_context from current thread state
+@@ -477,7 +536,7 @@
+         return copied
+ 
+     def rebuild_thread_context(self, ts: Optional[int] = None):
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         ts = ts or get_cur_time_ns()
+@@ -487,7 +546,7 @@
+         self,
+         ts: Optional[int] = None,
+     ):
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         ts = ts or get_cur_time_ns()
+@@ -498,11 +557,18 @@
+         external_trace_context = _trace_context_propagator.extract(
+             self.external_trace_header or {}
+         )
++
++        if _ettr_enabled():
++            # Requests/Tokenizer are transport context only. Preserve the real
++            # engine_request parent through serialization without a phantom ID.
++            self.root_span_context = external_trace_context
++            self.thread_context = self.__create_thread_context(ts)
++            return
+ 
+         # Drop the worker_id added by MultiTokenizer
+         orig_rid = self.rid.split("_")[-1]
+         role = "" if self.role == "unified" else self.role
+-        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
++        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}", **_code_attributes()}
+         if self.bootstrap_room:
+             attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
+         root_span = tracer.start_span(
+@@ -521,10 +587,10 @@
+     def trace_req_finish(
+         self, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None
+     ):
+-        if not self.tracing_enable:
+-            return
+-
+-        if not self.root_span:
++        if not self.tracing_enable or _tracing_stopped():
++            return
++
++        if not self.root_span and not _ettr_enabled():
+             return
+ 
+         ts = ts or get_cur_time_ns()
+@@ -532,17 +598,20 @@
+         # End all unclosed thread spans.
+         self.abort()
+ 
+-        if attrs:
+-            self.root_span.set_attributes(attrs)
+-
+-        self.root_span.end(end_time=ts)
+-        self.root_span = None
++        if self.root_span is not None:
++            if attrs:
++                self.root_span.set_attributes(attrs)
++            self.root_span.end(end_time=ts)
++            self.root_span = None
+ 
+     def __check_fast_return(self, level=None):
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return True
+ 
+         if not self.thread_context:
++            return True
++
++        if _ettr_enabled() and self.thread_context.thread_info.thread_label == "Tokenizer":
+             return True
+ 
+         if level and level > self.trace_level:
+@@ -558,6 +627,8 @@
+     ):
+         if self.__check_fast_return(level):
+             return
++        if _ettr_enabled() and name in ("prefill_waiting", "decode_waiting"):
++            return
+ 
+         ts = ts or get_cur_time_ns()
+ 
+@@ -577,12 +648,13 @@
+         else:
+             parent_span = self.thread_context.cur_slice_stack[-1].span
+ 
+-        parent_span_context = trace.set_span_in_context(parent_span)
++        parent_span_context = trace.set_span_in_context(parent_span) if parent_span else self.root_span_context
+ 
+         span = tracer.start_span(
+             name=cur_slice.slice_name,
+             start_time=cur_slice.start_time_ns,
+             context=parent_span_context,
++            attributes={**((self.thread_context.thread_attrs or {}) if parent_span is None else {}), **_code_attributes()},
+         )
+         cur_slice.span = span
+ 
+@@ -600,6 +672,11 @@
+         thread_finish_flag: bool = False,
+     ):
+         if self.__check_fast_return(level):
++            return
++
++        if _ettr_enabled() and name in ("prefill_waiting", "decode_waiting"):
++            if thread_finish_flag:
++                self.abort(ts)
+             return
+ 
+         if not self.thread_context.cur_slice_stack:
+@@ -655,6 +732,10 @@
+     ):
+         if self.__check_fast_return(slice.level):
+             return
++        if _ettr_enabled() and slice.slice_name in ("prefill_waiting", "decode_waiting"):
++            if thread_finish_flag:
++                self.abort(slice.end_time_ns)
++            return
+ 
+         parent_span = self.thread_context.thread_span
+         prev_span_context = None
+@@ -664,12 +745,13 @@
+         else:
+             parent_span = self.thread_context.cur_slice_stack[-1].span
+ 
+-        parent_span_context = trace.set_span_in_context(parent_span)
++        parent_span_context = trace.set_span_in_context(parent_span) if parent_span else self.root_span_context
+ 
+         span = tracer.start_span(
+             name=slice.slice_name,
+             start_time=slice.start_time_ns,
+             context=parent_span_context,
++            attributes={**((self.thread_context.thread_attrs or {}) if parent_span is None else {}), **_code_attributes()},
+         )
+ 
+         if prev_span_context:
+@@ -724,7 +806,7 @@
+         self.events_cache.append(TraceEvent(name, ts, attrs))
+ 
+     def trace_set_root_attrs(self, attrs: Dict[str, Any]):
+-        if not self.tracing_enable:
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         if self.root_span:
+@@ -736,13 +818,67 @@
+ 
+         if self.thread_context.thread_span:
+             self.thread_context.thread_span.set_attributes(attrs)
++        elif self.thread_context.thread_attrs is not None:
++            self.thread_context.thread_attrs.update(attrs)
++            for slice in self.thread_context.cur_slice_stack:
++                slice.span.set_attributes(attrs)
+ 
+     def abort(self, ts=None, abort_info: Optional[Dict] = None):
+-        if self.__check_fast_return():
++        if not self.tracing_enable or _tracing_stopped():
+             return
+ 
+         # close all slice spans (unlikely, except error API usage)
+         ts = ts or get_cur_time_ns()
++        if abort_info and not isinstance(abort_info, dict):
++            abort_info = abort_info.to_json()
++
++        def record_abort(span):
++            if not abort_info or not span.is_recording():
++                return
++            span.set_attributes(abort_info)
++            if _ettr_enabled() and (
++                abort_info.get("status_code") == 499
++                or abort_info.get("reason") == "have unclosed span, auto closed"
++                or (abort_info.get("reason") == "Aborted" and abort_info.get("status_code") in (None, 499))
++            ):
++                from relax.utils.tracing_shutdown import mark_interrupted
++
++                mark_interrupted(span, "aborted", str(abort_info.get("reason") or abort_info.get("message")
++                                                         or "generation_cancelled_http_499"))
++            else:
++                span.set_status(Status(StatusCode.ERROR))
++
++        if (_ettr_enabled() and self.thread_context is not None
++                and self.thread_context.thread_info.thread_label == "Tokenizer"):
++            self.events_cache = []
++            self.thread_context = None
++            return
++
++        # Only the Tokenizer owner holds this root. Copies must not end or
++        # modify another process's Req; normal thread completion also calls abort.
++        if abort_info and _ettr_enabled() and self.root_span is not None:
++            record_abort(self.root_span)
++        if self.thread_context is None:
++            if abort_info and _ettr_enabled() and self.root_span is not None:
++                self.root_span.end(end_time=ts)
++                self.root_span = None
++            return
++        if self.thread_context.thread_span is None and (abort_info or self.events_cache):
++            # With no Scheduler wrapper, retain diagnostics on the active slice.
++            # If all slices ended, emit an instantaneous diagnostic at this boundary.
++            stack = self.thread_context.cur_slice_stack
++            diagnostic = stack[-1].span if stack else tracer.start_span(
++                "scheduler.abort" if abort_info else "scheduler.events",
++                start_time=ts, context=self.root_span_context,
++                attributes={**(self.thread_context.thread_attrs or {}), **_code_attributes()},
++            )
++            if abort_info:
++                record_abort(diagnostic)
++            for event in self.events_cache:
++                diagnostic.add_event(event.event_name, timestamp=event.ts, attributes=event.attrs)
++            self.events_cache = []
++            if not stack:
++                diagnostic.end(end_time=ts)
+         while len(self.thread_context.cur_slice_stack) > 0:
+             if self.thread_context.cur_slice_stack[-1].span:
+                 self.thread_context.cur_slice_stack[-1].span.end(end_time=ts)
+@@ -751,12 +887,7 @@
+         # set abort info into thread span
+         if self.thread_context.thread_span:
+             if abort_info:
+-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+-
+-                if isinstance(abort_info, BaseFinishReason):
+-                    abort_info = abort_info.to_json()
+-                self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
+-                self.thread_context.thread_span.set_attributes(abort_info)
++                record_abort(self.thread_context.thread_span)
+ 
+             if self.events_cache:
+                 for event in self.events_cache:
+@@ -770,8 +901,25 @@
+             self.thread_context.thread_span.end(end_time=ts)
+         self.thread_context = None
+ 
++        if abort_info and _ettr_enabled() and self.root_span is not None:
++            self.root_span.end(end_time=ts)
++            self.root_span = None
++
+     def __del__(self):
+-        self.abort(abort_info={"reason": "have unclosed span, auto closed"})
++        try:
++            ts = get_cur_time_ns()
++            self.abort(ts=ts, abort_info={"reason": "have unclosed span, auto closed"})
++            if _ettr_enabled() and getattr(self, "root_span", None) is not None:
++                # The HTTP cancellation path may discard the owner without
++                # trace_req_finish. Close the actual root, preserving its ID.
++                from relax.utils.tracing_shutdown import mark_interrupted
++
++                mark_interrupted(self.root_span, "aborted", "request_context_discarded_without_finish")
++                self.root_span.end(end_time=ts)
++                self.root_span = None
++        except Exception:
++            # Best effort during interpreter teardown; never change a request result.
++            pass
+ 
+ 
+ @dataclass
+@@ -805,3 +953,50 @@
+     GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL = "gen_ai.latency.time_in_model_prefill"
+     GEN_AI_LATENCY_TIME_IN_MODEL_DECODE = "gen_ai.latency.time_in_model_decode"
+     GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE = "gen_ai.latency.time_in_model_inference"
++
++
++# Relax's opt-in lifecycle overlay. These wrappers do not import Relax or the
++# SDK when disabled, and never create a span for an individual weight bucket.
++def trace_lifecycle(name):
++    def decorate(function):
++        @functools.wraps(function)
++        def wrapper(*args, **kwargs):
++            if os.environ.get("RELAX_OTEL_ENABLED") != "1":
++                return function(*args, **kwargs)
++            from relax.utils.tracing_sglang_lifecycle import lifecycle
++
++            with lifecycle(sys.modules[__name__], name, function):
++                return function(*args, **kwargs)
++        return wrapper
++    return decorate
++
++
++def trace_weight_update(function):
++    @functools.wraps(function)
++    def wrapper(self, recv_req, *args, **kwargs):
++        if os.environ.get("RELAX_OTEL_ENABLED") != "1":
++            return function(self, recv_req, *args, **kwargs)
++        from relax.utils.tracing_sglang_lifecycle import weight_result, weight_update
++
++        with weight_update(sys.modules[__name__], self, recv_req, function):
++            result = function(self, recv_req, *args, **kwargs)
++        weight_result(self, result)
++        return result
++    return wrapper
++
++
++def trace_weight_resume(function):
++    @functools.wraps(function)
++    def wrapper(self, *args, **kwargs):
++        if os.environ.get("RELAX_OTEL_ENABLED") != "1":
++            return function(self, *args, **kwargs)
++        from relax.utils.tracing_sglang_lifecycle import weight_resume
++
++        try:
++            result = function(self, *args, **kwargs)
++        except BaseException as exc:
++            weight_resume(self.weight_updater, type(exc).__name__)
++            raise
++        weight_resume(self.weight_updater)
++        return result
++    return wrapper

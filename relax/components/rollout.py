@@ -20,6 +20,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.tracing import remote_context, stage, traced
 
 
 app = FastAPI()
@@ -324,6 +325,7 @@ ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS
 class Rollout(Base):
     """The class to run rollout and convert rollout data to training data."""
 
+    @traced("service.init", role="rollout", startup_wait="rollout.wait_start")
     def __init__(
         self,
         healthy: Any,
@@ -336,8 +338,9 @@ class Rollout(Base):
         self.config = config
         self.healthy = healthy
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        with stage("service.init.data_client", level=2):
+            tq.init(self.config.tq_config)
+            self.data_system_client = tq.get_client()
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
@@ -372,15 +375,18 @@ class Rollout(Base):
         self._logger.info(f"Checking whether to evaluate rollout {step}, should_eval: {should_eval}")
         return should_eval
 
-    async def run(self) -> None:
+    @traced("service.run", role="rollout", finish_startup_wait=True)
+    async def run(self, *, _trace_context: Optional[dict] = None) -> None:
         if self._run_task is not None and not self._run_task.done():
-            await self._run_task
+            with stage("rollout.wait_existing_run", level=2):
+                await self._run_task
             return
         if self.config.rollout_global_dataset:
-            try:
-                await self.rollout_manager.load.remote(self.step - 1)
-            except Exception as e:
-                self._logger.exception(f"Failed to load global dataset: {e}")
+            with stage("rollout.restore_data", level=2):
+                try:
+                    await self.rollout_manager.load.remote(self.step - 1)
+                except Exception as e:
+                    self._logger.exception(f"Failed to load global dataset: {e}")
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
@@ -397,6 +403,7 @@ class Rollout(Base):
         del rollout
         self._peer_barrier = peers
 
+    @traced("rollout.evaluate", role="rollout", step_arg="rollout_id", level=2)
     async def _run_eval_with_mark(self, rollout_id: int) -> None:
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
 
@@ -414,38 +421,43 @@ class Rollout(Base):
                 local_step = self.step
 
                 if self.eval_handler is not None:
-                    await self.eval_handler
-                    self.eval_handler = None
+                    with stage("rollout.wait_eval", level=2, **{"relax.rollout.next_step": local_step}):
+                        await self.eval_handler
+                        self.eval_handler = None
 
                 if self._stop_event.is_set():
                     self._logger.info("Rollout loop stopping by request")
                     break
 
-                while self.status == "paused":
-                    self._logger.info("Rollout loop paused, waiting to resume...")
-                    await asyncio.sleep(1)
+                with stage("rollout.wait_resume", level=2, **{"relax.rollout.next_step": local_step}):
+                    while self.status == "paused":
+                        self._logger.info("Rollout loop paused, waiting to resume...")
+                        await asyncio.sleep(1)
 
-                is_final_backfill_step = False
-                if local_step >= self.config.num_rollout:
-                    final_partition_id = f"train_{self.config.num_rollout - 1}"
-                    if (
-                        local_step == self.config.num_rollout
-                        and getattr(self.config, "fully_async", False)
-                        and not await self._async_check_partition_production_complete(final_partition_id)
-                    ):
-                        self._logger.warning(
-                            f"Final rollout partition {final_partition_id} is not complete; running backfill step"
-                        )
-                        is_final_backfill_step = True
-                    else:
-                        self._logger.info("All rollouts finished")
-                        break
+                with stage("rollout.check_completion", level=2, **{"relax.rollout.next_step": local_step}):
+                    is_final_backfill_step = False
+                    if local_step >= self.config.num_rollout:
+                        final_partition_id = f"train_{self.config.num_rollout - 1}"
+                        if (
+                            local_step == self.config.num_rollout
+                            and getattr(self.config, "fully_async", False)
+                            and not await self._async_check_partition_production_complete(final_partition_id)
+                        ):
+                            self._logger.warning(
+                                f"Final rollout partition {final_partition_id} is not complete; running backfill step"
+                            )
+                            is_final_backfill_step = True
+                        else:
+                            self._logger.info("All rollouts finished")
+                            break
 
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
-                    await self.rollout_manager.generate.remote(rollout_id=local_step)
-                    if self.config.offload_rollout:
-                        await self.rollout_manager.offload.remote()
+                    with stage("rollout.step", **{"relax.role": "rollout", "relax.step": local_step}):
+                        await self.rollout_manager.generate.remote(rollout_id=local_step, **remote_context())
+                        if self.config.offload_rollout:
+                            with stage("rollout.offload", level=2):
+                                await self.rollout_manager.offload.remote()
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
@@ -455,66 +467,69 @@ class Rollout(Base):
                     break
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
 
-                try:
-                    self.healthy.update_heartbeat.remote("rollout", local_step + 1)
-                except Exception:
-                    pass
+                with stage("rollout.report_progress", level=2, **{"relax.step": local_step}):
+                    try:
+                        self.healthy.update_heartbeat.remote("rollout", local_step + 1)
+                    except Exception:
+                        pass
 
-                wait_count = 0
-                while True:
-                    if self._stop_event.is_set():
-                        self._logger.info("Rollout loop stopping during staleness wait")
-                        return
-                    partition_list = await self.data_system_client.async_get_partition_list()
-                    rollout_done = local_step + 1 >= self.config.num_rollout
-                    should_continue = rollout_done or satisfy_staleness(
-                        partition_list, local_step, self.config.max_staleness
-                    )
-                    # Colocate barrier: don't start round N+1 until every
-                    # sharing peer (actor / critic / ...) has advanced its step
-                    # past `local_step` — their step increments after
-                    # ``async_train`` returns (which includes the post-train
-                    # sleep), guaranteeing the GPU is released before SGLang
-                    # tries to resume.
-                    if (
-                        should_continue
-                        and not rollout_done
-                        and self._peer_barrier is not None
-                        and not self._peer_barrier.is_empty()
-                    ):
-                        pending = await self._peer_barrier.list_pending_async(local_step)
-                        if pending:
-                            should_continue = False
-                            if wait_count % 30 == 0:
-                                desc = ", ".join(f"{r}(step={s})" for r, s in pending)
-                                self._logger.info(
-                                    f"Rollout {local_step}: waiting for peers to finish round {local_step}: {desc}"
-                                )
-                    if not should_continue:
-                        should_log = (wait_count >= 1200 and wait_count % 30 == 0) or (
-                            600 <= wait_count < 1200 and wait_count % 60 == 0
+                with stage("rollout.wait_staleness", level=2, **{"relax.step": local_step}):
+                    wait_count = 0
+                    while True:
+                        if self._stop_event.is_set():
+                            self._logger.info("Rollout loop stopping during staleness wait")
+                            return
+                        partition_list = await self.data_system_client.async_get_partition_list()
+                        rollout_done = local_step + 1 >= self.config.num_rollout
+                        should_continue = rollout_done or satisfy_staleness(
+                            partition_list, local_step, self.config.max_staleness
                         )
-                        if should_log:
-                            self._logger.warning(
-                                f"Rollout {local_step}: still waiting for data system to catch up "
-                                f"after {wait_count}s, possibly hang. Current partitions: {partition_list}"
+                        # Colocate barrier: don't start round N+1 until every
+                        # sharing peer (actor / critic / ...) has advanced its step
+                        # past `local_step` — their step increments after
+                        # ``async_train`` returns (which includes the post-train
+                        # sleep), guaranteeing the GPU is released before SGLang
+                        # tries to resume.
+                        if (
+                            should_continue
+                            and not rollout_done
+                            and self._peer_barrier is not None
+                            and not self._peer_barrier.is_empty()
+                        ):
+                            pending = await self._peer_barrier.list_pending_async(local_step)
+                            if pending:
+                                should_continue = False
+                                if wait_count % 30 == 0:
+                                    desc = ", ".join(f"{r}(step={s})" for r, s in pending)
+                                    self._logger.info(
+                                        f"Rollout {local_step}: waiting for peers to finish round {local_step}: {desc}"
+                                    )
+                        if not should_continue:
+                            should_log = (wait_count >= 1200 and wait_count % 30 == 0) or (
+                                600 <= wait_count < 1200 and wait_count % 60 == 0
                             )
-                        wait_count += 1
-                        await asyncio.sleep(1)
-                        continue
-                    else:
-                        if wait_count > 0:
-                            self._logger.info(f"Rollout {local_step}: data system caught up after {wait_count}s")
-                        break
+                            if should_log:
+                                self._logger.warning(
+                                    f"Rollout {local_step}: still waiting for data system to catch up "
+                                    f"after {wait_count}s, possibly hang. Current partitions: {partition_list}"
+                                )
+                            wait_count += 1
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            if wait_count > 0:
+                                self._logger.info(f"Rollout {local_step}: data system caught up after {wait_count}s")
+                            break
 
                 await self._maybe_save_data(local_step)
-                self.step += 1
-                if is_final_backfill_step:
-                    final_partition_id = f"train_{self.config.num_rollout - 1}"
-                    if not await self._async_check_partition_production_complete(final_partition_id):
-                        raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
-                    self._logger.info("All rollouts finished")
-                    break
+                with stage("rollout.finalize_step", level=2, **{"relax.step": local_step}):
+                    self.step += 1
+                    if is_final_backfill_step:
+                        final_partition_id = f"train_{self.config.num_rollout - 1}"
+                        if not await self._async_check_partition_production_complete(final_partition_id):
+                            raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
+                        self._logger.info("All rollouts finished")
+                        break
         except Exception as e:
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
@@ -522,6 +537,7 @@ class Rollout(Base):
             if not getattr(self.config, "use_health_check", False):
                 raise
 
+    @traced("rollout.save_data", role="rollout", step_arg="local_step", level=2)
     async def _maybe_save_data(self, local_step) -> None:
         if self.config.save is None or self.config.save_interval is None:
             return

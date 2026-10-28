@@ -23,6 +23,7 @@ from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias
+from relax.utils.tracing import traced
 from relax.utils.training.ppo_utils import (
     use_critic_lm_head_for_hf_load,
     use_sequence_classification_lm_head_for_hf_load,
@@ -651,6 +652,7 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
     }
 
 
+@traced("checkpoint.load")
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()

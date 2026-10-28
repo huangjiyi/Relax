@@ -10,6 +10,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.env import Envs
+from relax.utils.tracing import remote_context
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 
@@ -133,18 +134,24 @@ class RayTrainGroup:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
 
+    def _trace_context(self) -> dict:
+        # Other backends keep their existing method signatures.
+        return remote_context() if getattr(self.args, "train_backend", "megatron") == "megatron" else {}
+
     def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
         self.args = args
         return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            actor.init.remote(
+                args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher, **self._trace_context()
+            )
             for actor in self._actor_handlers
         ]
 
     def async_train(self, rollout_id):
         """Do one rollout training."""
-        return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
+        return [actor.train.remote(rollout_id, **self._trace_context()) for actor in self._actor_handlers]
 
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
@@ -156,7 +163,7 @@ class RayTrainGroup:
 
     def train_fully_async(self, rollout_id):
         """Do one rollout training without ref log prob computation."""
-        return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
+        return [actor.train_async.remote(rollout_id, **self._trace_context()) for actor in self._actor_handlers]
 
     def train_hybrid(self, rollout_id):
         """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
@@ -164,11 +171,16 @@ class RayTrainGroup:
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""
-        ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+        ray.get(
+            [
+                actor.save_model.remote(rollout_id, force_sync=force_sync, **self._trace_context())
+                for actor in self._actor_handlers
+            ]
+        )
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
-        ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        ray.get([actor.update_weights.remote(**self._trace_context()) for actor in self._actor_handlers])
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and
@@ -176,7 +188,7 @@ class RayTrainGroup:
         ray.get(
             [
                 actor.update_weights_fully_async.remote(
-                    rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+                    rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, **self._trace_context()
                 )
                 for actor in self._actor_handlers
             ]

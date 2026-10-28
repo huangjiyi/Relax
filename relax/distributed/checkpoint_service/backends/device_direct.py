@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.tracing import weight_context
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -273,6 +274,10 @@ class DeviceDirectBackend(CommBackend):
                 payload_cur = payload.get(int(rank), {}) if payload else None
             else:
                 payload_cur = payload
+            if endpoint.lstrip("/") in ("update_weights_from_distributed", "update_weights_from_tensor"):
+                context = weight_context()
+                if context:
+                    payload_cur = {**(payload_cur or {}), **context}
             future = engine.make_request.remote(endpoint, payload_cur)
             futures.append(future)
         return futures

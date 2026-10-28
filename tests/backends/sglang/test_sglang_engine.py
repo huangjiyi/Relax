@@ -149,3 +149,48 @@ def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_eng
     monkeypatch.setattr(engine, "_make_request", request)
     assert engine.update_weight_version("7") == {"success": True}
     request.assert_called_once_with("update_weight_version", {"new_version": "7", "abort_all_requests": False})
+
+
+@pytest.mark.parametrize("failure", ["connect", "read", "reset", "http", "json", "exhausted"])
+def test_weight_http_retries_only_unsent_connect_timeout(monkeypatch, sglang_engine_module, failure):
+    module = sglang_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "localhost", 1234
+    response = Mock()
+    response.json.return_value = {"success": True}
+    session = Mock()
+    errors = {
+        "connect": module.requests.exceptions.ConnectTimeout("connect"),
+        "read": module.requests.exceptions.ReadTimeout("read"),
+        "reset": module.requests.exceptions.ConnectionError("reset"),
+        "http": module.requests.exceptions.HTTPError("http"),
+        "json": ValueError("bad response"),
+        "exhausted": module.requests.exceptions.ConnectTimeout("connect"),
+    }
+    error = errors[failure]
+    if failure == "http":
+        response.raise_for_status.side_effect = error
+    elif failure == "json":
+        response.json.side_effect = error
+    session.post.side_effect = (
+        [error, response, response] if failure == "connect"
+        else [error, error, error] if failure == "exhausted"
+        else [error] if failure in ("read", "reset") else [response]
+    )
+    create = Mock(return_value=session)
+    monkeypatch.setattr(module.requests, "Session", create)
+    monkeypatch.setattr(module.time, "sleep", Mock())
+    payload = {"serialized_named_tensors": ["bucket"], "weight_version": "3"}
+    if failure == "connect":
+        assert engine._make_request("update_weights_from_tensor", payload) == {"success": True}
+        assert engine._make_request("update_weights_from_tensor", payload) == {"success": True}
+        create.assert_called_once()
+        assert session.post.call_count == 3
+    else:
+        with pytest.raises(type(error)):
+            engine._make_request("update_weights_from_tensor", payload)
+        assert session.post.call_count == (3 if failure == "exhausted" else 1)
+    for call in session.post.call_args_list:
+        assert call.args == ("http://localhost:1234/update_weights_from_tensor",)
+        assert call.kwargs == {"json": payload, "timeout": (10, None)}

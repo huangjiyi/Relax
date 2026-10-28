@@ -18,6 +18,7 @@ from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
+from relax.utils.tracing import remote_context, traced
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .actor_group import RayTrainGroup
@@ -108,6 +109,7 @@ def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: 
     )
 
 
+@traced("service.init.resources", level=2)
 def create_placement_group(
     num_gpus: int, node_group_affinity: bool = True
 ) -> tuple[PlacementGroup, list[int], list[int]]:
@@ -167,6 +169,7 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     )
 
 
+@traced("rollout.init.manager_wait", level=2)
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     from .rollout import RolloutManager
 
@@ -190,7 +193,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source)
+    ).remote(args, pg, data_source=data_source, **remote_context())
 
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:

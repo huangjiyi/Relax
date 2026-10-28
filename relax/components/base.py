@@ -90,6 +90,14 @@ class Base:
         self._logger_instance = None
         self._lock = threading.Lock()
 
+    async def finish_tracing(self, reason: str = "controller_shutdown") -> bool:
+        """Export open service spans before teardown; does not cancel model work."""
+        import asyncio
+
+        from relax.utils.tracing import shutdown_tracing
+
+        return await asyncio.to_thread(shutdown_tracing, reason)
+
     @property
     def _logger(self):
         """Lazily create and cache a logger for this instance.
