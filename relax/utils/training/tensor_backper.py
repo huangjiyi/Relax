@@ -56,29 +56,33 @@ class _TensorBackuperNormal(TensorBackuper):
         return list(self._backups)
 
     def get(self, tag: str):
-        if tag == "actor" and getattr(self, "_actor_dirty", False):
-            raise RuntimeError("Actor snapshot is awaiting completion of a forward weight transfer")
+        if tag == "actor" and getattr(self, "_actor_backup_pending", False):
+            raise RuntimeError("Actor CPU backup is awaiting completion of weight sync")
         return self._backups[tag]
 
-    def mark_actor_dirty(self) -> None:
+    def mark_actor_backup_pending(self) -> None:
+        """Block reads of the old CPU backup until the new backup is ready."""
         if set(self._backups) != {"actor"}:
-            raise RuntimeError("Fused forward sync requires a single actor snapshot")
-        self._actor_dirty = True
+            raise RuntimeError("Reusing the CPU backup requires a single actor snapshot")
+        self._actor_backup_pending = True
 
-    def adopt_actor_backing(self, tensors: dict[str, torch.Tensor]) -> None:
-        """Borrow completed selective-offload backing for the sole actor
-        tag."""
+    def reuse_actor_cpu_backup(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Use completed offloader CPU tensors as the Actor backup without
+        copying.
+
+        The caller must wait for the CPU copy to finish before passing tensors.
+        """
         if set(self._backups) != {"actor"} or set(tensors) != set(self._backups["actor"]):
-            raise RuntimeError("Shared offload backing requires complete, single-version actor coverage")
+            raise RuntimeError("CPU backup must contain every weight from the current Actor snapshot")
         if any(t.device.type != "cpu" for t in tensors.values()):
-            raise ValueError("Actor backing must be on CPU")
+            raise ValueError("Actor weight backup must be on CPU")
         if any(
             tensor.shape != self._backups["actor"][name].shape or tensor.dtype != self._backups["actor"][name].dtype
             for name, tensor in tensors.items()
         ):
-            raise ValueError("Actor backing shape/dtype changed")
+            raise ValueError("Actor CPU backup shape/dtype changed")
         self._backups["actor"] = tensors
-        self._actor_dirty = False
+        self._actor_backup_pending = False
 
     @torch.no_grad()
     def backup(self, tag: str) -> None:
@@ -89,7 +93,7 @@ class _TensorBackuperNormal(TensorBackuper):
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_module.synchronize()
         if tag == "actor":
-            self._actor_dirty = False
+            self._actor_backup_pending = False
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):

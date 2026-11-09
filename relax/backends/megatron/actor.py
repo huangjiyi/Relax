@@ -515,22 +515,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # (VMM pause) or manual selective CPU offload based on TMS availability;
         # both implementations live in the offloader. No-op when offload_train is off.
         self._train_state_offloader = MegatronTrainStateOffloader(self.model, self.optimizer, args)
-        from .weight_update.colocate import agree_fused_colocate, fused_colocate_reason
-
-        reason = fused_colocate_reason(
-            args,
-            role=role,
-            with_ref=with_ref,
-            with_teacher=with_opd_teacher,
-            uses_tms=self._train_state_offloader.uses_tms,
-        )
-        if reason is None:
-            try:
-                reason = self._train_state_offloader.fused_support_reason()
-            except (AttributeError, TypeError, ValueError) as error:
-                reason = f"Unsupported offloader capability: {error}"
-        self._fused_colocate = agree_fused_colocate(reason, get_gloo_group())
-        self._fused_forward_pending = False
+        # Set after training; blocks sleep until weight sync and CPU backup finish.
+        self._actor_weights_pending_sync = False
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -614,7 +600,25 @@ class MegatronTrainRayActor(TrainRayActor):
                 quantization_config=push_quant_config,
             )
             if self.args.colocate:
-                self.weight_updater.fused_colocate_requested = self._fused_colocate and not push_quant_config
+                # Keep Actor GPU weights until the receivers finish reading them.
+                # CPU backup may finish before the transfer or overlap with it.
+                self.weight_updater.actor_weight_retention_requested |= Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
+                if self.weight_updater.actor_weight_retention_requested:
+                    from .weight_update.utils import validate_actor_weight_retention
+
+                    reason = validate_actor_weight_retention(
+                        args,
+                        role=role,
+                        with_ref=with_ref,
+                        with_teacher=with_opd_teacher,
+                        requested=True,
+                    )
+                    if reason is None:
+                        try:
+                            reason = self._train_state_offloader.validate_actor_weight_retention()
+                        except (AttributeError, TypeError, ValueError) as error:
+                            reason = f"Unsupported offloader capability: {error}"
+                    self.weight_updater.actor_weight_retention_fallback_reason = reason
         elif not skip_weight_management:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -822,11 +826,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if not hasattr(self, "weights_backuper") or self._resident_sft_params_pending:
             return
         if (
-            getattr(getattr(self, "weight_updater", None), "fused_colocate", False)
+            getattr(getattr(self, "weight_updater", None), "actor_weight_retention_enabled", False)
             and getattr(self, "rollout_manager", None) is not None
         ):
-            self.weights_backuper.mark_actor_dirty()
-            self._fused_forward_pending = True
+            self.weights_backuper.mark_actor_backup_pending()
+            self._actor_weights_pending_sync = True
             return
         # Resident SFT eval/checkpoint readers use self.model directly. Keep
         # initialization and explicit reader flushes intact, but avoid copying
@@ -860,6 +864,8 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if getattr(self, "_actor_weights_pending_sync", False):
+            raise RuntimeError("Cannot sleep while weight sync owns the training parameters")
         self._flush_resident_sft_parameters()
 
         clear_memory(clear_host_memory=True)
@@ -2245,8 +2251,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if use_indexer_replay:
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
-        # Include the actor snapshot, offload, transfer and both rollout resumes.
-        colocate_transition_started = time.perf_counter()
+        # Time CPU backup, Actor offload, weight transfer, KV reload and generation resume.
+        colocate_transition_started = (
+            time.perf_counter()
+            if getattr(getattr(self, "weight_updater", None), "actor_weight_retention_enabled", False)
+            else None
+        )
         # update the cpu actor weight to the latest model
         self._backup_actor_weights_after_train()
 
@@ -2312,11 +2322,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
-            if self.args.offload_train and not getattr(self, "_fused_forward_pending", False):
+            if self.args.offload_train and not getattr(self, "_actor_weights_pending_sync", False):
                 self.sleep()
             if has_rollout:
                 self.update_weights()
-                if self.args.colocate and dist.get_rank(group=get_gloo_group()) == 0:
+                if colocate_transition_started is not None and dist.get_rank(group=get_gloo_group()) == 0:
                     logger.info(
                         "COLOCATE_TRANSITION step=%d seconds=%.6f",
                         rollout_id,
@@ -3021,40 +3031,41 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         self._flush_resident_sft_parameters()
-        fused = getattr(self, "_fused_forward_pending", False)
-        if fused:
-            from .weight_update.colocate import run_fused_phase, run_fused_root_calls
+        retain_actor_weights = getattr(self, "_actor_weights_pending_sync", False)
+        if retain_actor_weights:
+            from .weight_update.utils import run_rank0_rpc_calls, run_with_distributed_error_check
 
-            def begin_forward():
+            def prepare_actor_weights_for_sync():
                 if self._active_model_tag != "actor" or set(self.weights_backuper.backup_tags) != {"actor"}:
-                    raise RuntimeError("Fused forward sync requires the live actor version")
+                    raise RuntimeError("Source weight sync requires the live actor version")
                 weights = dict(
                     named_params_and_buffers(
                         self.args, self.model, convert_to_global_name=False, include_persistent_buffers=True
                     )
                 )
-                # Fence optimizer and parameter-gather side-stream writes before
-                # offloading state and starting concurrent immutable reads.
+                # Finish optimizer/parameter-gather writes before the CPU backup
+                # and weight sender read the same GPU parameters.
                 device_module.synchronize()
-                self._train_state_offloader.begin_forward_sync(weights)
+                self._train_state_offloader.begin_weight_sync(
+                    weights, overlap=Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
+                )
                 return weights
 
-            weights = run_fused_phase(begin_forward, get_gloo_group())
-            # Snapshot D2H runs on a separate stream; export reads the immutable
-            # resident tensors directly, never the not-yet-ready CPU backing.
+            weights = run_with_distributed_error_check(prepare_actor_weights_for_sync, get_gloo_group())
+            # Send from the unchanged GPU weights. The CPU backup may still be
+            # copying on another stream when overlap is enabled.
             self.weight_updater.weights_getter = lambda: weights
-            self.weight_updater.fused_forward_active = True
+            self.weight_updater.actor_weight_retention_active = True
 
         if self.args.offload_train:
-            # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
-            # completed sleep() (and released GPU memory via tms.pause()) before
-            # SGLang's resume_memory_occupation tries to reclaim GPU memory.
-            # Without this, rank 0 may trigger SGLang resume while other ranks
-            # still hold GPU memory, causing cuMemCreate OOM in SGLang schedulers.
+            # Wait for every Actor rank to free training-only state before
+            # SGLang allocates weights. The normal path has completed sleep();
+            # the retention path keeps model weights but frees gradients and
+            # offloads optimizer state. This avoids allocation races across ranks.
             dist.barrier(group=get_gloo_group())
 
-        if fused:
-            run_fused_root_calls([self.rollout_manager.onload_weights.remote], get_gloo_group())
+        if retain_actor_weights:
+            run_rank0_rpc_calls([self.rollout_manager.onload_weights.remote], get_gloo_group())
         elif self.args.offload_rollout and dist.get_rank() == 0:
             # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
@@ -3109,21 +3120,21 @@ class MegatronTrainRayActor(TrainRayActor):
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
-            if fused:
+            if retain_actor_weights:
                 # Receiver ACKs cover CUDA completion and closing source mappings.
-                def finish_forward():
-                    snapshot = self._train_state_offloader.finish_forward_sync()
-                    self.weights_backuper.adopt_actor_backing(snapshot)
+                def release_actor_weights_after_sync():
+                    snapshot = self._train_state_offloader.finish_weight_sync()
+                    self.weights_backuper.reuse_actor_cpu_backup(snapshot)
 
-                run_fused_phase(finish_forward, get_gloo_group())
+                run_with_distributed_error_check(release_actor_weights_after_sync, get_gloo_group())
                 self.weight_updater.weights_getter = lambda: self.weights_backuper.get("actor")
-                self.weight_updater.fused_forward_active = False
-                self._fused_forward_pending = False
-            light_cleanup = fused and Envs.RELAX_COLOCATE_LIGHT_CLEANUP
+                self.weight_updater.actor_weight_retention_active = False
+                self._actor_weights_pending_sync = False
+            light_cleanup = retain_actor_weights and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
             if light_cleanup:
-                # finish_forward_sync already releases parameter storage and
-                # empties its allocator cache. Keep the full-device fence, but
-                # avoid repeating a process-wide GC solely for memory logging.
+                # finish_weight_sync already frees parameters and empties the
+                # allocator cache. Wait for GPU completion, but skip the extra
+                # GC/cache cleanup normally performed by print_memory.
                 device_module.synchronize()
             print_memory(
                 "after update_weights", clear_before_print=not light_cleanup and not device_utils.is_npu_available
@@ -3149,9 +3160,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
         if reconnect_rollout_engines:
             self.sleep()
-        elif self.args.offload_train and not (fused and Envs.RELAX_COLOCATE_KEEP_PROCESS_GROUPS):
-            # Retaining the native fused training groups trades resident NCCL
-            # memory for avoiding per-step teardown/rebootstrap. Initial sync,
+        elif self.args.offload_train and not (retain_actor_weights and Envs.RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS):
+            # Keeping training communication groups uses NCCL memory but avoids
+            # destroying and recreating them each step. Initial sync,
             # explicit sleep and checkpoint teardown keep their usual cleanup.
             destroy_process_groups()
 
@@ -3166,11 +3177,11 @@ class MegatronTrainRayActor(TrainRayActor):
         # custom_reward_post_process function owns GenRM lifecycle, so skip
         # onloading GenRM here (it must stay offloaded for rollout to have
         # all GPUs during generate in shared-bundles mode).
-        if fused:
+        if retain_actor_weights:
             calls = [self.rollout_manager.onload_kv.remote]
             if self.genrm_manager and not getattr(self.args, "defer_reward_to_post_process", False):
                 calls.extend(manager.onload.remote for manager in self.genrm_manager)
-            run_fused_root_calls(calls, get_gloo_group())
+            run_rank0_rpc_calls(calls, get_gloo_group())
         elif self.args.offload_rollout and dist.get_rank() == 0:
             post_sync_handles = []
             if self._per_step_rollout:
@@ -3180,8 +3191,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
-        if fused:
-            self.weight_updater.resume_fused_generation()
+        if retain_actor_weights:
+            self.weight_updater.resume_generation_after_sync()
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

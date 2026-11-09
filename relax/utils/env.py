@@ -185,12 +185,6 @@ class _EnvsMeta(type):
 
 
 class Envs(metaclass=_EnvsMeta):
-    # ------------- Colocated training lifecycle -------------
-    RELAX_COLOCATE_FUSED_WEIGHT_SYNC = EnvProperty("RELAX_COLOCATE_FUSED_WEIGHT_SYNC", bool, True)
-    RELAX_COLOCATE_KEEP_PROCESS_GROUPS = EnvProperty("RELAX_COLOCATE_KEEP_PROCESS_GROUPS", bool, False)
-    RELAX_COLOCATE_LIGHT_CLEANUP = EnvProperty("RELAX_COLOCATE_LIGHT_CLEANUP", bool, False)
-    RELAX_SGLANG_CONTROL_POLL_INTERVAL = EnvProperty("RELAX_SGLANG_CONTROL_POLL_INTERVAL", float, 1.0)
-
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
@@ -357,6 +351,14 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES = EnvProperty(
         "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES", int, 512 * 1024**2
     )
+
+    # ------------- Colocate weight sync -------------
+    # Overlap the Actor CPU backup with sending weights to SGLang.
+    RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP = EnvProperty("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", bool, False)
+    # Reuse live training process groups after sync when Actor weights were retained.
+    RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS = EnvProperty("RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", bool, False)
+    # Seconds between SGLang health/abort-pause readiness checks; 1.0 disables the patch.
+    SGLANG_CONTROL_POLL_INTERVAL = EnvProperty("SGLANG_CONTROL_POLL_INTERVAL", float, 0.01)
 
     # ------------- Routing Replay -------------
     ENABLE_ROUTING_REPLAY = EnvProperty("ENABLE_ROUTING_REPLAY", bool, False)

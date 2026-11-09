@@ -55,6 +55,8 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch, sglang_engine_module, routing_replay, parent_alive
 ):
+    from relax.backends.sglang import control_polling_patch
+
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
@@ -73,17 +75,24 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
-    monkeypatch.setattr(module.Envs, "RELAX_SGLANG_CONTROL_POLL_INTERVAL", 1.0, raising=False)
-    server_args = SimpleNamespace()
+    interval = 0.01 if routing_replay else 1.0
+    monkeypatch.setattr(module.Envs, "SGLANG_CONTROL_POLL_INTERVAL", interval, raising=False)
+    patch_poll = Mock(side_effect=lambda *_args, **_kwargs: events.append("poll"))
+    monkeypatch.setattr(control_polling_patch, "patch_control_poll_interval", patch_poll)
+    server_args = SimpleNamespace(tokenizer_worker_num=1)
     module._launch_server_with_patches(server_args, 123)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == (["poll"] if routing_replay else []) + ["guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
+    if interval != 1.0:
+        patch_poll.assert_called_once_with(interval, tokenizer_worker_num=1)
+    else:
+        patch_poll.assert_not_called()
 
 
 @pytest.fixture
@@ -305,10 +314,21 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
 
 
 @pytest.mark.parametrize(
-    "existing", [None, [], ["custom.loader"], ["relax.backends.sglang.weight_loader.load_expert_slices"]]
+    "existing,colocate,fusion",
+    [
+        (None, True, False),
+        ([], True, False),
+        (["custom.loader"], True, False),
+        (["relax.backends.sglang.weight_loader.load_expert_slices"], True, False),
+        (["custom.loader"], True, True),
+        (["custom.loader"], False, True),
+    ],
 )
-def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sglang_engine_module, existing):
+def test_expert_slice_loader_registration_preserves_user_loaders(
+    monkeypatch, sglang_engine_module, existing, colocate, fusion
+):
     module = sglang_engine_module
+    monkeypatch.setattr(module.Envs, "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", fusion, raising=False)
     monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", [("custom_weight_loader", list, None)]))
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
     args = SimpleNamespace(
@@ -322,6 +342,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
         fp16=False,
+        colocate=colocate,
     )
     result, _ = module._compute_server_args(
         args,
@@ -338,10 +359,11 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
             [
                 *(existing or []),
                 "relax.backends.sglang.weight_loader.load_expert_slices",
-                "relax.backends.sglang.weight_loader.fence_native_weights",
             ]
         )
     )
+    if colocate and fusion:
+        expected.append("relax.backends.sglang.weight_loader.fence_native_weights")
     assert result["custom_weight_loader"] == expected
     assert result["custom_weight_loader"] is not existing
 

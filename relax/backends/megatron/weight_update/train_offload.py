@@ -28,7 +28,7 @@
 
 import os
 from contextlib import nullcontext
-from typing import ContextManager, Iterator, List, Optional, Protocol
+from typing import ContextManager, Iterable, Iterator, List, Optional, Protocol
 
 import torch
 
@@ -207,7 +207,17 @@ class _SelectiveOffloadStrategy:
                     _clear_on(dispatcher)
                     _clear_on(getattr(dispatcher, "_comm_manager", None))
 
-    def _offload_optimizer(self) -> None:
+    def _offload_training_state(self, *, retain_parameters: bool = False) -> None:
+        """Offload each buffer before the optimizer, optionally retaining GPU
+        parameters for sync."""
+        for buffer in self._iter_ddp_buffers():
+            if not retain_parameters:
+                self._copy_parameters_to_cpu((buffer,), non_blocking=False)
+                self._release_parameter_storage((buffer,))
+            if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
+                buffer.grad_data_size = buffer.grad_data.storage().size()
+                buffer.grad_data.storage().resize_(0)
+
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params (shard_fp32_from_float16_groups).
             for opt in self._iter_optimizers():
@@ -229,51 +239,44 @@ class _SelectiveOffloadStrategy:
                     if "exp_avg_sq" in state:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to("cpu", non_blocking=False)
 
-    def fused_optimizer_reason(self) -> str | None:
-        """Check the exact state layout handled by our offload/reload pair."""
+    def validate_optimizer_storage_aliases(self) -> str | None:
+        """Check storage aliases before retaining weights and releasing
+        gradients.
+
+        Inspect only tensors moved by ordinary offload. Optimizer configuration
+        and state handling remain the responsibility of the original path.
+        """
         if self._skip_optimizer:
             return None
-        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
         model_storages = {
-            tensor.untyped_storage().data_ptr()
+            (tensor.device, tensor.untyped_storage().data_ptr())
             for b in self._iter_ddp_buffers()
             for tensor in (b.param_data, b.grad_data)
             if tensor is not None and tensor.untyped_storage().nbytes()
         }
         for opt in self._iter_optimizers():
-            if not isinstance(opt, DistributedOptimizer) or getattr(
-                opt.config, "use_precision_aware_optimizer", False
-            ):
-                return "GPU optimizer master weights are not handled by selective offload"
+            tensors = [
+                p
+                for group in getattr(opt, "shard_fp32_from_float16_groups", []) or []
+                for p in (group if isinstance(group, list) else [group])
+                if p is not None
+            ]
             inner = getattr(opt, "optimizer", None)
-            if inner is None or type(inner).__name__ not in ("Adam", "FusedAdam"):
-                return "unsupported GPU optimizer implementation"
-            masters = getattr(opt, "shard_fp32_from_float16_groups", None)
-            if masters is None:
-                return "GPU optimizer has no explicit FP32 master shards"
-            tensors = [p for group in masters for p in group if p is not None]
-            for state in inner.state.values():
-                if set(state) - {"step", "exp_avg", "exp_avg_sq"}:
-                    return "unknown optimizer state requires the original lifecycle"
-                if isinstance(state.get("step"), torch.Tensor) and state["step"].device.type != "cpu":
-                    return "device optimizer step counter is not handled by selective offload"
-                tensors.extend(state[name] for name in ("exp_avg", "exp_avg_sq") if name in state)
+            if inner is not None:
+                for state in inner.state.values():
+                    tensors.extend(state[name] for name in ("exp_avg", "exp_avg_sq") if name in state)
             if any(
-                not isinstance(tensor, torch.Tensor) or tensor.untyped_storage().data_ptr() in model_storages
+                isinstance(tensor, torch.Tensor)
+                and (tensor.device, tensor.untyped_storage().data_ptr()) in model_storages
                 for tensor in tensors
             ):
-                return "optimizer state is invalid or aliases model parameters/gradients"
+                return "optimizer state aliases model parameters/gradients"
         return None
 
-    def _offload_gradients(self) -> None:
-        for buffer in self._iter_ddp_buffers():
-            if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                buffer.grad_data_size = buffer.grad_data.storage().size()
-                buffer.grad_data.storage().resize_(0)
-
-    def _backup_parameters(self, *, non_blocking: bool) -> None:
-        for buffer in self._iter_ddp_buffers():
+    def _copy_parameters_to_cpu(self, buffers: Iterable, *, non_blocking: bool) -> None:
+        """Copy DDP parameter buffers to reusable CPU storage."""
+        for buffer in buffers:
             param = buffer.param_data
             if param is None or param.storage().size() == 0:
                 continue
@@ -286,8 +289,10 @@ class _SelectiveOffloadStrategy:
             cpu.copy_(param, non_blocking=non_blocking)
             buffer.param_data_size = param.storage().size()
 
-    def _release_parameters(self) -> None:
-        for buffer in self._iter_ddp_buffers():
+    def _release_parameter_storage(self, buffers: Iterable) -> None:
+        """Expose completed CPU copies, then free the DDP buffers' GPU
+        storage."""
+        for buffer in buffers:
             param = buffer.param_data
             if param is None or param.storage().size() == 0:
                 continue
@@ -300,54 +305,52 @@ class _SelectiveOffloadStrategy:
     def offload(self) -> None:
         import gc
 
-        if getattr(self, "_forward_pending", False):
-            raise RuntimeError("A forward weight transfer still owns the training parameters")
+        if getattr(self, "_actor_weights_pending_release", False):
+            raise RuntimeError("A source weight transfer still owns the training parameters")
         self._clear_moe_dispatcher_caches()
-        self._backup_parameters(non_blocking=False)
-        self._release_parameters()
-        self._offload_gradients()
-        self._offload_optimizer()
+        self._offload_training_state()
         gc.collect()
         device_module.empty_cache()
 
     @torch.no_grad()
-    def begin_forward_sync(self, weights: dict[str, torch.Tensor]) -> None:
-        """Offload training-only state, then back up immutable GPU parameters.
+    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> None:
+        """Back up Actor weights to CPU while keeping their GPU storage
+        readable.
 
-        The caller must fence optimizer/parameter-gather writes first, and must
-        retain parameters until every receiver closes its IPC mappings. CPU
-        backing is shared with the actor snapshot, including tensors that do
-        not belong to a DDP parameter buffer (e.g. frozen vision weights).
+        The caller must first wait for optimizer and parameter-gather writes.
+        This method releases gradients and offloads optimizer state, but does
+        not send weights. With overlap=False it waits for the CPU backup before
+        returning. In both modes, keep GPU weights unchanged until the caller
+        receives every receiver ACK and calls finish_weight_sync.
         """
-        if getattr(self, "_forward_pending", False):
-            raise RuntimeError("A forward weight transfer is already pending")
+        if getattr(self, "_actor_weights_pending_release", False):
+            raise RuntimeError("A source weight transfer is already pending")
         buffers = list(self._iter_ddp_buffers())
         if not buffers or any(b.param_data is None or b.param_data.storage().size() == 0 for b in buffers):
-            raise RuntimeError("Forward sync requires resident DDP parameter allocations")
+            raise RuntimeError("Source weight sync requires resident DDP parameter allocations")
         parameter_storages = {b.param_data.untyped_storage().data_ptr() for b in buffers}
         if any(
             b.grad_data is not None and b.grad_data.untyped_storage().data_ptr() in parameter_storages for b in buffers
         ):
-            raise RuntimeError("Forward sync cannot release gradients that alias model parameters")
+            raise RuntimeError("Source weight sync cannot release gradients that alias model parameters")
         if any(t.device.type != "cuda" for t in weights.values()):
-            raise RuntimeError("Forward sync requires all exported parameters/buffers on CUDA")
-        reason = self.fused_optimizer_reason()
+            raise RuntimeError("Source weight sync requires all exported parameters/buffers on CUDA")
+        reason = self.validate_optimizer_storage_aliases()
         if reason is not None:
-            raise RuntimeError(f"Fused optimizer contract changed: {reason}")
+            raise RuntimeError(f"Optimizer state can no longer be offloaded safely: {reason}")
         self._clear_moe_dispatcher_caches()
-        self._offload_gradients()
         # TODO(agent): overlap optimizer-state D2H with weight sync once pinned
         # buffers, completion events, storage aliases and memory headroom are
         # qualified. For now finish its blocking offload before sending weights.
-        self._offload_optimizer()
+        self._offload_training_state(retain_parameters=True)
         device_module.empty_cache()
-        self._forward_pending = True
-        self._forward_stream = torch.cuda.Stream()
-        self._forward_stream.wait_stream(torch.cuda.current_stream())
+        self._actor_weights_pending_release = True
+        self._cpu_backup_stream = torch.cuda.Stream()
+        self._cpu_backup_stream.wait_stream(torch.cuda.current_stream())
         snapshot = {}
-        extras = getattr(self, "_extra_cpu_backing", {})
-        with torch.cuda.stream(self._forward_stream):
-            self._backup_parameters(non_blocking=True)
+        extras = getattr(self, "_standalone_cpu_weights", {})
+        with torch.cuda.stream(self._cpu_backup_stream):
+            self._copy_parameters_to_cpu(buffers, non_blocking=True)
             by_storage = {b.param_data.untyped_storage().data_ptr(): b.param_data for b in buffers}
             for name, tensor in weights.items():
                 flat = by_storage.get(tensor.untyped_storage().data_ptr())
@@ -362,23 +365,31 @@ class _SelectiveOffloadStrategy:
                         cpu = torch.empty_like(tensor, device="cpu", pin_memory=True)
                         extras[name] = cpu
                     if cpu.shape != tensor.shape or cpu.dtype != tensor.dtype:
-                        raise RuntimeError("Standalone parameter layout changed during forward sync")
+                        raise RuntimeError("Standalone parameter layout changed during source weight sync")
                     cpu.copy_(tensor.detach(), non_blocking=True)
                     snapshot[name] = cpu
-            self._forward_done = torch.cuda.Event()
-            self._forward_done.record()
-        self._extra_cpu_backing = extras
-        self._forward_snapshot = snapshot
+            self._cpu_backup_done = torch.cuda.Event()
+            self._cpu_backup_done.record()
+        self._standalone_cpu_weights = extras
+        self._cpu_weight_snapshot = snapshot
+        if not overlap:
+            self._cpu_backup_done.synchronize()
 
     @torch.no_grad()
-    def finish_forward_sync(self) -> dict[str, torch.Tensor]:
-        """Called only after GPU completion AND all receiver release ACKs."""
-        if not getattr(self, "_forward_pending", False):
-            raise RuntimeError("No forward weight transfer is pending")
-        self._forward_done.synchronize()
-        self._release_parameters()
-        self._forward_pending = False
-        snapshot, self._forward_snapshot = self._forward_snapshot, None
+    def finish_weight_sync(self) -> dict[str, torch.Tensor]:
+        """Wait for CPU backup, free GPU parameter storage, and return CPU
+        views.
+
+        The caller must already have all receiver ACKs, including completion of
+        CUDA reads and closure of IPC mappings. This method does not wait for
+        receivers itself.
+        """
+        if not getattr(self, "_actor_weights_pending_release", False):
+            raise RuntimeError("No source weight transfer is pending")
+        self._cpu_backup_done.synchronize()
+        self._release_parameter_storage(self._iter_ddp_buffers())
+        self._actor_weights_pending_release = False
+        snapshot, self._cpu_weight_snapshot = self._cpu_weight_snapshot, None
         device_module.empty_cache()
         return snapshot
 
@@ -386,8 +397,8 @@ class _SelectiveOffloadStrategy:
     def reload(self) -> None:
         import gc
 
-        if getattr(self, "_forward_pending", False):
-            raise RuntimeError("Cannot reload while a forward weight transfer is pending")
+        if getattr(self, "_actor_weights_pending_release", False):
+            raise RuntimeError("Cannot reload while a source weight transfer is pending")
         device = device_utils.make_current_torch_device()
         # 1. Model DDP flat buffers.
         for buffer in self._iter_ddp_buffers():
@@ -534,22 +545,28 @@ class MegatronTrainStateOffloader:
         if self.enabled:
             self._strategy.reload()
 
-    def begin_forward_sync(self, weights: dict[str, torch.Tensor]) -> None:
+    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> None:
+        """Prepare the CPU backup and retain Actor GPU weights for the
+        sender."""
         if not self.enabled or self.uses_tms:
-            raise RuntimeError("Fused forward sync requires selective train-state offload")
-        self._strategy.begin_forward_sync(weights)
+            raise RuntimeError("Source weight sync requires selective train-state offload")
+        self._strategy.begin_weight_sync(weights, overlap=overlap)
 
-    def fused_support_reason(self) -> str | None:
+    def validate_actor_weight_retention(self) -> str | None:
+        """Check selective offload, CUDA and optimizer support without changing
+        state."""
         if not self.enabled or self.uses_tms:
             return "requires selective train-state offload"
         if not torch.cuda.is_available() or torch.version.hip is not None:
-            return "native fused transfer requires CUDA"
-        return self._strategy.fused_optimizer_reason()
+            return "source weight transfer requires CUDA"
+        return self._strategy.validate_optimizer_storage_aliases()
 
-    def finish_forward_sync(self) -> dict[str, torch.Tensor]:
+    def finish_weight_sync(self) -> dict[str, torch.Tensor]:
+        """Release Actor GPU weights after receiver ACKs; return the CPU
+        backup."""
         if not self.enabled or self.uses_tms:
-            raise RuntimeError("Fused forward sync requires selective train-state offload")
-        return self._strategy.finish_forward_sync()
+            raise RuntimeError("Source weight sync requires selective train-state offload")
+        return self._strategy.finish_weight_sync()
 
     def disable_during_update(self) -> ContextManager:
         """Context manager wrapping weight update so offload bookkeeping stays

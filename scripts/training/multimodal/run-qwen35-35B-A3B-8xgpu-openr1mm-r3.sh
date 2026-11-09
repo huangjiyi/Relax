@@ -119,9 +119,6 @@ WANDB_ARGS=(
 )
 
 MISC_ARGS=(
-   # Bound resident Actor communication buffers during colocate rollout.
-   # Keep SGLang's communicator settings unchanged.
-   --train-env-vars '{"NCCL_BUFFSIZE":"1048576","NCCL_MAX_CTAS":"8","NCCL_NVLS_ENABLE":"0"}'
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -130,7 +127,21 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
+   # Limit NCCL buffer memory for Actor processes.
+   --train-env-vars '{"NCCL_BUFFSIZE":"1048576","NCCL_MAX_CTAS":"8","NCCL_NVLS_ENABLE":"0"}'
 )
+
+# Enable colocate weight-sync optimizations in the Ray job environment.
+RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+d = json.loads(os.environ["RUNTIME_ENV_JSON"])
+d.setdefault("env_vars", {}).update({
+    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1",
+    "RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS": "1",
+})
+print(json.dumps(d))
+')
+export RUNTIME_ENV_JSON
 
 mkdir -p log
 

@@ -16,8 +16,12 @@ _PARAMETER = re.compile(r"model\.layers\.\d+\.mlp\.experts\.(w13_weight|w2_weigh
 
 
 def fence_native_weights(model: torch.nn.Module, weights: Sequence[tuple[str, torch.Tensor]]) -> None:
-    """ACK only after every stream has finished reading the native IPC
-    update."""
+    """Wait for CUDA reads before SGLang acknowledges this empty weight update.
+
+    Each TP worker waits for all streams on its current device. This loader
+    does not load tensors or release Actor memory; its import path is part of
+    the sender/receiver compatibility check.
+    """
     if weights:
         raise ValueError("A native weight fence must not contain tensors")
     torch.cuda.synchronize()
