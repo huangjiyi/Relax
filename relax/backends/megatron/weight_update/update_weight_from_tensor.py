@@ -769,7 +769,6 @@ class UpdateWeightFromTensor:
             serialized_empty = [
                 MultiprocessingSerializer.serialize([], output_str=True)
             ] * self.args.rollout_num_gpus_per_engine
-            self._routed_engine_call(all_engines, "end_weight_update")
             self._routed_engine_call(
                 all_engines,
                 "update_weights_from_tensor",
@@ -777,6 +776,7 @@ class UpdateWeightFromTensor:
                 load_format=NATIVE_SYNC_FENCE_LOADER,
                 flush_cache=False,
             )
+            self._routed_engine_call(all_engines, "end_weight_update")
             if expert_ipc is not None:
                 self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
         elif rank == 0:
