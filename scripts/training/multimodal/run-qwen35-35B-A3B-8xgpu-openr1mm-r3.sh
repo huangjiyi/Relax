@@ -118,10 +118,37 @@ WANDB_ARGS=(
    --tb-experiment-name qwen35-35B-A3B-openr1mm-r3-${now}
 )
 
+# Carry explicit values through the Ray job and detached rollout workers.
+# Override these variables to compare against the same recipe with them off.
+RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+d = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env = d.setdefault("env_vars", {})
+for name, default in {
+    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1",
+    "RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS": "1",
+    "SGLANG_CONTROL_POLL_INTERVAL": "0.01",
+}.items():
+    env[name] = os.environ.get(name, env.get(name, default))
+propagate = set(env.get("RELAX_PROPAGATE_ENV_VARS", "").split(","))
+propagate.update(os.environ.get("RELAX_PROPAGATE_ENV_VARS", "").split(","))
+propagate.add("SGLANG_CONTROL_POLL_INTERVAL")
+env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(sorted(propagate - {""}))
+print(json.dumps(d))
+')
+export RUNTIME_ENV_JSON
+
 MISC_ARGS=(
    # Retain training communicators independently of weight-backup overlap.
    --selective-offload
-   --train-env-vars '{"RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS":"1","NCCL_BUFFSIZE":"1048576","NCCL_MAX_CTAS":"8","NCCL_NVLS_ENABLE":"0"}'
+   --train-env-vars "$(python3 -c '
+import json, os
+env = json.loads(os.environ["RUNTIME_ENV_JSON"])["env_vars"]
+print(json.dumps({
+    "RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS": env["RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS"],
+    "NCCL_BUFFSIZE": "1048576", "NCCL_MAX_CTAS": "8", "NCCL_NVLS_ENABLE": "0",
+}))
+')"
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -132,16 +159,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-# Enable colocate weight-sync optimizations in the Ray job environment.
-RUNTIME_ENV_JSON=$(python3 -c '
-import json, os
-d = json.loads(os.environ["RUNTIME_ENV_JSON"])
-d.setdefault("env_vars", {}).update({
-    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1",
-})
-print(json.dumps(d))
-')
-export RUNTIME_ENV_JSON
+# This script-local switch also allows a native-sync comparison without edits.
+case "${COLOCATE_SHARD_P2P_WEIGHT_SYNC:-1}" in
+   1) MISC_ARGS+=(--use-shard-p2p-weight-sync) ;;
+   0) ;;
+   *) echo "COLOCATE_SHARD_P2P_WEIGHT_SYNC must be 0 or 1" >&2; exit 1 ;;
+esac
 
 mkdir -p log
 
