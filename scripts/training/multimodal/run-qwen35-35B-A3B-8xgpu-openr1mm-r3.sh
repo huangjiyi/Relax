@@ -119,6 +119,8 @@ WANDB_ARGS=(
 )
 
 MISC_ARGS=(
+   --selective-offload
+   --train-env-vars '{"RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS":"1"}'
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
