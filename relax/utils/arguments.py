@@ -705,6 +705,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-compact-tq-text",
+                action="store_true",
+                help="Experimentally send supported text SFT batches as contiguous tensors to SimpleStorage.",
+            )
+            parser.add_argument(
+                "--sft-local-prepared-batches",
+                type=str,
+                default=None,
+                help="Local full-epoch input already encoded and DP-balanced by a CPU producer.",
+            )
+            parser.add_argument(
+                "--sft-local-text-dir",
+                type=str,
+                default=None,
+                help="Single-node SFT text input prepared with the native JSONL row index and epoch order.",
+            )
+            parser.add_argument(
                 "--custom-dataset-class",
                 "--custom-dataset-class-path",
                 dest="custom_dataset_class_path",

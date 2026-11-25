@@ -45,6 +45,21 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     if not is_offline_mode(config):
         return
 
+    from relax.engine.sft.local_text import local_text_sft, validate_local_text_sft
+
+    if local_text_sft(config):
+        size = validate_local_text_sft(config)
+        steps, remainder = divmod(size, config.global_batch_size)
+        if not steps or config.num_rollout not in (None, steps):
+            raise ValueError("Local text SFT requires a complete epoch with no explicit step limit.")
+        config._sft_train_dataset_size = size
+        config._sft_dataset_names = ()
+        config.num_rollout_per_epoch = steps if not remainder else None
+        config.num_rollout_per_epoch_for_metrics = size / config.global_batch_size
+        config.num_rollout = steps
+        logger.info("Offline num_rollout resolved: %s (train_size=%s, local text)", steps, size)
+        return
+
     if is_i2i_sft(config):
         import math
 
