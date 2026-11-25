@@ -22,6 +22,9 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 source "${RELAX_ROOT}/scripts/models/qwen3-0.6B.sh"
+if [[ ${RELAX_QWEN3_DENSE_SPEC_COMPAT:-0} == 1 ]]; then
+    MODEL_ARGS+=(--spec scripts.training.sft.qwen3_dense_layer_spec build_layer_spec)
+fi
 
 : "${MODEL_DIR:?Set MODEL_DIR to the HF model directory or its parent}"
 : "${DATA_DIR:?Set DATA_DIR to the directory containing the JSONL dataset}"
@@ -96,6 +99,7 @@ OPTIMIZER_ARGS=(
 MONITOR_ARGS=(
     --use-clearml
     --use-metrics-service
+    --no-use-tensorboard
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-${ATTEMPT_ID:-initial}"
 )

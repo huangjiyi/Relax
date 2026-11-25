@@ -23,6 +23,36 @@ name to start another Ray job with the same native checkpoint load path.
 Set `DATA_PIPELINE=transfer-queue` to select the optional compact
 TransferQueue comparison.
 
+## QS custom training launch command
+
+Configure `RELAX_REPO_URL`, `RELAX_BRANCH`, and the full `RELAX_COMMIT` in the
+QS task environment. Set `MODEL_DIR`, `DATA_DIR`, `DATA_FILE`, `SAVE_DIR`, and
+`LOCAL_CACHE_DIR` for that task's mounts. The image must provide the compatible
+Ray, PyTorch, Megatron and Transformer Engine runtime. For the QS Megatron image
+whose dense layer factory lacks the legacy grouped GEMM argument, set
+`RELAX_QWEN3_DENSE_SPEC_COMPAT=1` to use the bundled Qwen3 layer spec.
+
+```bash
+set -euo pipefail
+: "${RELAX_REPO_URL:?Set the Relax repository URL}"
+: "${RELAX_BRANCH:?Set the branch containing the revision}"
+: "${RELAX_COMMIT:?Set the full Relax commit SHA}"
+
+RELAX_CHECKOUT=$(mktemp -d "${TMPDIR:-/tmp}/relax-sft.XXXXXX")
+git clone --no-checkout --single-branch --branch "$RELAX_BRANCH" \
+  "$RELAX_REPO_URL" "$RELAX_CHECKOUT"
+git -C "$RELAX_CHECKOUT" checkout --detach "$RELAX_COMMIT"
+test "$(git -C "$RELAX_CHECKOUT" rev-parse HEAD)" = "$RELAX_COMMIT"
+test -z "$(git -C "$RELAX_CHECKOUT" status --porcelain)"
+
+cd "$RELAX_CHECKOUT"
+exec bash "$PWD/scripts/training/sft/run-qwen3-0.6B-8xgpu-prepared-sft.sh"
+```
+
+The recipe keeps the metrics service and health monitoring enabled and disables
+TensorBoard writes. The platform's model publication can be configured separately
+from training.
+
 Set `PUBLISH_MODEL_NAME` on a QS node to publish the final HF export. The
 launcher uses the installed `model_tools` uploader and defaults to
 `MODEL_STORE_USER` and `MODEL_STORE_TOKEN`. Set `PUBLISH_USER_ENV` and
