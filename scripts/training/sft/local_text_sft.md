@@ -1,15 +1,39 @@
 # Single-node text SFT and model publication
 
-The launcher takes a Ray job JSON whose entrypoint runs
-`python -m relax.entrypoints.train`. Keep the model, training settings and
-runtime environment in that JSON. The entrypoint needs `--save` and
-`--save-hf`. A new run writes both outputs under its own run directory.
+The Qwen3-0.6B recipe is a repository training script with model, data,
+checkpoint, optimizer, and performance flags in Bash arrays. It builds the
+Ray submission from those arguments.
 
-On a QS node, start with `--dry-run` to review the paths and the target model.
-The launcher uses the installed `model_tools` uploader. By default it reads
-`MODEL_STORE_USER` and `MODEL_STORE_TOKEN`. Use `--publisher-user-env` and
-`--publisher-token-env` to refer to the credential variables already present
-in your environment.
+```bash
+MODEL_DIR="$MODELS" DATA_DIR="$DATASETS" SAVE_DIR="$CHECKPOINTS" \
+  bash scripts/training/sft/run-qwen3-0.6B-8xgpu-prepared-sft.sh --dry-run
+```
+
+Set `MODEL_DIR` to the HF model directory or its parent with a
+`Qwen3-0.6B` subdirectory. Put the OpenAI Chat JSONL in
+`$DATA_DIR/train.jsonl`. Use `DATA_FILE` to select a different file under
+`DATA_DIR`. Use `LOCAL_CACHE_DIR` to choose node-local storage with room for
+the source, indices, and prepared batches. The default uses the system
+temporary directory. Remove `--dry-run` to launch training.
+
+The recipe saves checkpoints and HF weights under `$SAVE_DIR/$EXP_NAME`.
+For a new experiment, choose a new `EXP_NAME`. Once a previous attempt has
+ended, set a new `ATTEMPT_ID` with the same save directory and experiment
+name to start another Ray job with the same native checkpoint load path.
+Set `DATA_PIPELINE=transfer-queue` to select the optional compact
+TransferQueue comparison.
+
+Set `PUBLISH_MODEL_NAME` on a QS node to publish the final HF export. The
+launcher uses the installed `model_tools` uploader and defaults to
+`MODEL_STORE_USER` and `MODEL_STORE_TOKEN`. Set `PUBLISH_USER_ENV` and
+`PUBLISH_TOKEN_ENV` to select other credential variables.
+
+## Launch or publish from a saved Ray spec
+
+The Python helper also accepts a Ray job JSON whose entrypoint runs
+`python -m relax.entrypoints.train` with `--save` and `--save-hf`. Set
+`--publisher-user-env` and `--publisher-token-env` if you invoke it directly
+with a custom authentication environment.
 
 ```bash
 python scripts/training/sft/relax_sft_train_and_publish.py \

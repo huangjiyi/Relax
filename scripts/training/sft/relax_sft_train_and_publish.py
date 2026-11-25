@@ -31,7 +31,7 @@ def write_json(path: Path, data: dict) -> None:
 
 
 def prepare_spec(path: Path, run_dir: Path | None, prepare_dir: Path | None = None) -> tuple[dict, Path, str]:
-    spec = json.loads(path.read_text())
+    spec = json.loads(sys.stdin.read() if path == Path("-") else path.read_text())
     argv = shlex.split(spec["entrypoint"])
     if argv[1:3] != ["-m", "relax.entrypoints.train"]:
         raise ValueError("The job spec must launch python -m relax.entrypoints.train.")
@@ -75,16 +75,27 @@ def ray_request(dashboard: str, path: str = "", body: dict | None = None):
         return json.load(response)
 
 
+def lookup_job(dashboard: str, job_id: str) -> dict | None:
+    try:
+        return ray_request(dashboard, job_id)
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+        return None
+
+
+def require_idle_cluster(dashboard: str) -> None:
+    if any(job.get("status") in ("PENDING", "RUNNING") for job in ray_request(dashboard)):
+        raise RuntimeError("The Ray cluster already has an active job.")
+
+
 def wait_for_training(dashboard: str, spec: dict, submit: bool) -> None:
     job_id = quote(spec["submission_id"], safe="")
-    try:
-        job = ray_request(dashboard, job_id)
-    except HTTPError as error:
-        if error.code != 404 or not submit:
-            raise
-        jobs = ray_request(dashboard)
-        if any(j.get("status") in ("PENDING", "RUNNING") for j in jobs):
-            raise RuntimeError("The QS debug Ray cluster already has an active job.")
+    job = lookup_job(dashboard, job_id)
+    if job is None:
+        if not submit:
+            raise RuntimeError(f"Ray job {spec['submission_id']} was not found.")
+        require_idle_cluster(dashboard)
         ray_request(dashboard, body=spec)
         job = ray_request(dashboard, job_id)
     print(f"Waiting for Ray job {spec['submission_id']}", flush=True)
@@ -214,9 +225,10 @@ def publish(artifact: Path, model_name: str, receipt: Path, precision: str, publ
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--job-spec", type=Path, required=True, help="Existing native Relax Ray job JSON.")
-    parser.add_argument("--model-name", required=True, help="Destination model name in the QS registry.")
+    parser.add_argument("--job-spec", type=Path, required=True, help="Native Relax Ray job JSON (file or '-').")
+    parser.add_argument("--model-name", help="Destination model name in the QS registry.")
     parser.add_argument("--run-dir", type=Path, help="Submit a new run here. Otherwise wait for the existing job.")
+    parser.add_argument("--attempt", help="Name a new Ray attempt that resumes from the same run directory.")
     parser.add_argument("--prepare-dir", type=Path, help="Build local text caches for a new run from its JSONL input.")
     parser.add_argument("--prep-workers", type=int, default=14)
     parser.add_argument("--ray-dashboard", default="http://127.0.0.1:8265")
@@ -238,42 +250,57 @@ def main() -> None:
     if prepare_dir is not None and (run_dir is None or args.prep_workers < 1):
         parser.error("--prepare-dir requires --run-dir and a positive --prep-workers value.")
     spec, checkpoint, template = prepare_spec(args.job_spec, run_dir, prepare_dir)
+    recorded_name = "ray-submit.json"
+    if args.attempt:
+        argv = shlex.split(spec["entrypoint"])
+        if run_dir is None or "--load" not in argv or Path(argv[argv.index("--load") + 1]).resolve() != checkpoint:
+            parser.error("--attempt requires --run-dir and --load pointing to its checkpoint directory.")
+        attempt_key = hashlib.sha256(args.attempt.encode()).hexdigest()[:12]
+        spec["submission_id"] += f"-{attempt_key}"
+        recorded_name = f"ray-submit-{attempt_key}.json"
     print(f"Ray job {spec['submission_id']} | checkpoint {checkpoint} | HF {template}")
-    print(f"QS model {args.model_name} | precision {args.precision}")
+    if args.model_name:
+        print(f"QS model {args.model_name} | precision {args.precision}")
     if args.dry_run:
+        print(spec["entrypoint"])
         return
-    user = os.getenv(args.publisher_user_env)
-    token = os.getenv(args.publisher_token_env)
-    if not user or not token or importlib.util.find_spec("model_tools") is None:
-        raise RuntimeError(
-            "Provide uploader credentials via the selected environment variables and install model_tools."
-        )
-    publisher = {
-        "user": user,
-        "token": token,
-        "env": args.publisher_environment,
-        "zone": args.publisher_zone,
-        "region": args.publisher_region,
-    }
+    publisher = None
+    if args.model_name:
+        user = os.getenv(args.publisher_user_env)
+        token = os.getenv(args.publisher_token_env)
+        if not user or not token or importlib.util.find_spec("model_tools") is None:
+            raise RuntimeError(
+                "Provide uploader credentials via the selected environment variables and install model_tools."
+            )
+        publisher = {
+            "user": user,
+            "token": token,
+            "env": args.publisher_environment,
+            "zone": args.publisher_zone,
+            "region": args.publisher_region,
+        }
 
     record_dir = run_dir or checkpoint.parent
     record_dir.mkdir(parents=True, exist_ok=True)
     with (record_dir / "train-and-publish.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if run_dir is not None:
-            recorded_spec = run_dir / "ray-submit.json"
+            recorded_spec = run_dir / recorded_name
             if recorded_spec.exists():
                 if json.loads(recorded_spec.read_text()) != spec:
                     raise ValueError(f"A different job spec already occupies {run_dir}.")
             else:
-                if checkpoint.exists() or (run_dir / "output_hf").exists():
+                if not args.attempt and (checkpoint.exists() or (run_dir / "output_hf").exists()):
                     raise ValueError(f"Checkpoint artifacts already occupy {run_dir}.")
                 write_json(recorded_spec, spec)
-        if prepare_dir is not None:
+        if prepare_dir is not None and lookup_job(args.ray_dashboard, quote(spec["submission_id"], safe="")) is None:
+            require_idle_cluster(args.ray_dashboard)
             start_batch_preparation(spec, prepare_dir, record_dir, args.prep_workers)
         wait_for_training(args.ray_dashboard, spec, submit=run_dir is not None)
         artifact = final_hf_directory(checkpoint, template)
-        publish(artifact, args.model_name, record_dir / "qs-model-publish.json", args.precision, publisher)
+        print(f"Final HF export: {artifact}", flush=True)
+        if publisher is not None:
+            publish(artifact, args.model_name, record_dir / "qs-model-publish.json", args.precision, publisher)
 
 
 if __name__ == "__main__":
