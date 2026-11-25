@@ -26,8 +26,14 @@ TransferQueue comparison.
 ## QS custom training launch command
 
 Configure `RELAX_REPO_URL`, `RELAX_BRANCH`, and the full `RELAX_COMMIT` in the
-QS task environment. Set `MODEL_DIR`, `DATA_DIR`, `DATA_FILE`, `SAVE_DIR`, and
-`LOCAL_CACHE_DIR` for that task's mounts. The image must provide the compatible
+QS task environment. Set `DATA_DIR`, `DATA_FILE`, `SAVE_DIR`, and
+`LOCAL_CACHE_DIR` for that task's mounts. Set `MODEL_DIR` for a mounted HF model,
+or leave it unset and configure `MODEL_DOWNLOAD_DIR` (an absolute writable
+directory), `MODEL_DOWNLOAD_NAME`, `MODEL_DOWNLOAD_VERSION`, and
+`MODEL_DOWNLOAD_SUBVERSION`. The downloader uses the image's `model_tools`
+SDK and reads credentials from `MODEL_STORE_USER` and `MODEL_STORE_TOKEN` by
+default. Use `MODEL_DOWNLOAD_USER_ENV` and `MODEL_DOWNLOAD_TOKEN_ENV` to select
+different task environment variables. The image must provide the compatible
 Ray, PyTorch, Megatron and Transformer Engine runtime. For the QS Megatron image
 whose dense layer factory lacks the legacy grouped GEMM argument, set
 `RELAX_QWEN3_DENSE_SPEC_COMPAT=1` to use the bundled Qwen3 layer spec.
@@ -46,8 +52,24 @@ test "$(git -C "$RELAX_CHECKOUT" rev-parse HEAD)" = "$RELAX_COMMIT"
 test -z "$(git -C "$RELAX_CHECKOUT" status --porcelain)"
 
 cd "$RELAX_CHECKOUT"
+if [[ -z ${MODEL_DIR:-} ]]; then
+  python3 "$PWD/scripts/training/sft/download_qs_model.py" \
+    --output-dir "${MODEL_DOWNLOAD_DIR:?Set the absolute model destination}" \
+    --model-name "${MODEL_DOWNLOAD_NAME:?Set the QS model name}" \
+    --version "${MODEL_DOWNLOAD_VERSION:?Set the QS model version}" \
+    --subversion "${MODEL_DOWNLOAD_SUBVERSION:?Set the QS model subversion}" \
+    --user-env "${MODEL_DOWNLOAD_USER_ENV:-MODEL_STORE_USER}" \
+    --token-env "${MODEL_DOWNLOAD_TOKEN_ENV:-MODEL_STORE_TOKEN}" \
+    --zone "${MODEL_DOWNLOAD_ZONE:-cn}" \
+    --region "${MODEL_DOWNLOAD_REGION:-}"
+  export MODEL_DIR="$MODEL_DOWNLOAD_DIR"
+fi
 exec bash "$PWD/scripts/training/sft/run-qwen3-0.6B-8xgpu-prepared-sft.sh"
 ```
+
+The download step reuses a validated cache of the selected model version.
+For a cache miss, it downloads to a temporary directory next to the destination
+and moves the validated model into place before exporting `MODEL_DIR`.
 
 The recipe keeps the metrics service and health monitoring enabled and disables
 TensorBoard writes. The platform's model publication can be configured separately
