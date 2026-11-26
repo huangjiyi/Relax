@@ -3,7 +3,7 @@
 import math
 from argparse import Namespace
 from collections.abc import Callable, Iterator
-from functools import partial
+from functools import cache, partial
 from typing import Any
 
 import torch
@@ -19,6 +19,7 @@ from relax.algorithms.spec import ALGORITHM_SPECS
 from relax.engine.sft.runtime import is_embedding_sft_mode, is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -1454,6 +1455,48 @@ def sft_loss_function(
     return _sft_response_loss(args, batch, logits, sum_of_sample_mean)
 
 
+@cache
+def _log_batched_sft_ce() -> None:
+    get_logger(__name__).info("Batched SFT CE enabled for packed TP1/CP1 logits")
+
+
+def _batched_sft_log_probs(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+) -> torch.Tensor | None:
+    lengths = batch["total_lengths"]
+    if (
+        args.qkv_format != "thd"
+        or args.rollout_temperature != 1.0
+        or mpu.get_context_parallel_world_size() != 1
+        or mpu.get_tensor_model_parallel_world_size() != 1
+        or batch.get("dynamic_cp_size") not in (None, 1)
+        or not lengths
+        or lengths != batch["response_lengths"]
+        or min(lengths) < 1
+    ):
+        return None
+
+    labels = batch.get("unconcat_pre_shifted_labels")
+    if labels is None:
+        tokens = torch.cat(batch["unconcat_tokens"])
+        sample_ends = torch.as_tensor(lengths, device=tokens.device).cumsum(0) - 1
+        targets = tokens.roll(-1).index_fill_(0, sample_ends, 0)
+    else:
+        targets = torch.cat(labels)
+        targets = targets.masked_fill(targets.eq(-100), 0)
+
+    # Take one view of the packed logits so backward does not expand a
+    # full-size gradient separately for every sample.
+    token_logits = logits.squeeze(0).narrow(0, 0, targets.numel())
+    log_probs, _ = calculate_log_probs_and_entropy(
+        token_logits, targets, mpu.get_tensor_model_parallel_group(), with_entropy=False
+    )
+    _log_batched_sft_ce()
+    return log_probs.squeeze(-1)
+
+
 def _sft_response_loss(
     args: Namespace,
     batch: RolloutBatch,
@@ -1463,23 +1506,25 @@ def _sft_response_loss(
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     selective_logit_rows: list[tuple[int, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    _, scores = get_log_probs_and_entropy(
-        model_output,
-        args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=batch["total_lengths"],
-        response_lengths=batch["response_lengths"],
-        pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
-        with_entropy=False,
-        max_seq_lens=batch.get("max_seq_lens"),
-        padded_total_lengths=batch.get("padded_total_lengths"),
-        cp_output_is_zigzag=batch.get("cp_output_is_zigzag", False),
-        dynamic_cp_size=batch.get("dynamic_cp_size"),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank"),
-        lm_head_forward=lm_head_forward,
-        selective_logit_rows=selective_logit_rows,
-    )
-    log_probs = torch.cat(scores["log_probs"], dim=0)
+    log_probs = _batched_sft_log_probs(args, batch, model_output) if lm_head_forward is None else None
+    if log_probs is None:
+        _, scores = get_log_probs_and_entropy(
+            model_output,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
+            with_entropy=False,
+            max_seq_lens=batch.get("max_seq_lens"),
+            padded_total_lengths=batch.get("padded_total_lengths"),
+            cp_output_is_zigzag=batch.get("cp_output_is_zigzag", False),
+            dynamic_cp_size=batch.get("dynamic_cp_size"),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank"),
+            lm_head_forward=lm_head_forward,
+            selective_logit_rows=selective_logit_rows,
+        )
+        log_probs = torch.cat(scores["log_probs"], dim=0)
     loss = -sum_of_sample_mean(log_probs)
     # Keep empty response shards connected to the model output for backward.
     if log_probs.numel() == 0:

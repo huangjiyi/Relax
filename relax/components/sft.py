@@ -33,6 +33,7 @@ from functools import partial
 from typing import Any
 
 import ray
+import torch
 import torch.nn.functional as F
 from ray import serve
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
@@ -241,11 +242,46 @@ def _create_sft_train_dataset(
     )
 
 
+_COMPACT_TEXT_SEQUENCE_FIELDS = ("tokens", "loss_masks", "pre_shifted_labels")
+_COMPACT_TEXT_BATCH_FIELDS = {
+    *_COMPACT_TEXT_SEQUENCE_FIELDS,
+    "total_lengths",
+    "response_lengths",
+    "dataset_ids",
+    "sample_weights",
+}
+
+
+def _restore_text_sft_tq_rows(fields: dict[str, Any]) -> dict[str, Any]:
+    lengths = fields["total_lengths"].reshape(-1).tolist()
+    for key in _COMPACT_TEXT_SEQUENCE_FIELDS:
+        if key in fields:
+            fields[key] = [row[:length] for row, length in zip(fields[key].unbind(0), lengths, strict=True)]
+    return fields
+
+
+def _compact_text_sft_tensordict(batch: dict[str, Any]):
+    if batch.keys() - _COMPACT_TEXT_BATCH_FIELDS:
+        return None
+
+    lengths = batch["total_lengths"]
+    if max(lengths) * len(lengths) > 8 * sum(lengths):
+        return None
+
+    fields = batch.copy()
+    sequences = {key: fields.pop(key) for key in _COMPACT_TEXT_SEQUENCE_FIELDS if key in fields}
+    data = dict_to_tensordict(fields, batch_size=len(lengths))
+    for key, rows in sequences.items():
+        data[key] = torch.nn.utils.rnn.pad_sequence(rows, batch_first=True)
+    return data
+
+
 def _prepare_sft_tq_payload(
     samples: list[ProcessedSample] | list[ProcessedPreferencePair],
     *,
     force_multimodal_field: bool,
     force_image_refs_field: bool = False,
+    compact_text: bool = False,
 ) -> dict[str, Any]:
     if samples and isinstance(samples[0], ProcessedPreferencePair):
         backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
@@ -259,6 +295,15 @@ def _prepare_sft_tq_payload(
         force_image_refs_field=force_image_refs_field,
     )
     assert backend_batch is not None
+
+    if compact_text:
+        packed = _compact_text_sft_tensordict(backend_batch)
+        if packed is not None:
+            return {
+                "data": packed,
+                "custom_meta": [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]],
+                "data_parser": _restore_text_sft_tq_rows,
+            }
     return {
         "data": dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
         "custom_meta": [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]],
@@ -1084,27 +1129,42 @@ class SFT(Base):
             save_data_state(self.config, self._dataset, self.step + 1, self._train_size, samples)
         self._maybe_print_first_sample(samples)
         put_started = time.monotonic()
+        pack_s = 0.0
+        compact_shards = 0
+        storage_manager = getattr(self.data_system_client, "storage_manager", None)
+        compact_text = (
+            getattr(self.config, "sft_compact_tq_text", False)
+            and type(storage_manager).__name__ == "AsyncSimpleStorageManager"
+        )
         for partition_id, shard_samples in zip(
             partition_ids,
             _split_sft_samples_for_shards(samples, num_shards),
             strict=True,
         ):
+            pack_started = time.monotonic()
             payload = _prepare_sft_tq_payload(
                 shard_samples,
                 force_multimodal_field=self.config.multimodal_keys is not None,
                 force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                compact_text=compact_text,
             )
+            pack_s += time.monotonic() - pack_started
+            parser = payload.get("data_parser")
+            compact_shards += parser is not None
             await self.data_system_client.async_put(
                 data=payload["data"],
                 partition_id=partition_id,
                 custom_meta=payload["custom_meta"],
+                data_parser=parser,
             )
+        put_s = time.monotonic() - put_started
         # The consumer's ``per_rank_fetch_time`` converges to this cadence once the
         # producer is the pacer, so keep the split visible per step.
         self._logger.info(
             f"SFT producer step {self.step}: {len(samples)} samples — wait {waited_s:.1f}s, "
             f"batch {batch_s:.1f}s ({batch_s / max(1, len(samples)) * 1000:.0f} ms/sample, "
-            f"pool={_PRODUCER_POOL_SIZE}), put {time.monotonic() - put_started:.1f}s"
+            f"pool={_PRODUCER_POOL_SIZE}), put {put_s:.1f}s (pack {pack_s:.3f}s, "
+            f"transfer {put_s - pack_s:.3f}s, compact_shards={compact_shards})"
         )
         if crossed_epoch:
             self._logger.info(

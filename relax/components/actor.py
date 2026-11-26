@@ -14,6 +14,7 @@ from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_sync import complete_inference_step
 from relax.distributed.ray.placement_group import allocate_train_group
+from relax.engine.sft.local_text import local_text_sft
 from relax.engine.sft.runtime import (
     is_dpo_mode,
     is_offline_mode,
@@ -170,6 +171,8 @@ class Actor(Base):
         await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
 
     def _reset_consumption(self) -> None:
+        if local_text_sft(self.config):
+            return
         for partition_id in sft_partition_ids(self.config, self.step):
             self.data_system_client.reset_consumption(
                 partition_id=partition_id,
@@ -204,7 +207,7 @@ class Actor(Base):
 
                 self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
 
-                if did_train:
+                if did_train and not local_text_sft(self.config):
                     for partition_id in sft_partition_ids(self.config, local_step):
                         run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
@@ -245,6 +248,8 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
+        if local_text_sft(self.config):
+            return True
         partition_list = run(self.data_system_client.async_get_partition_list())
         if not partition_list or not all(
             partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
@@ -353,16 +358,16 @@ class Actor(Base):
         try:
             # Check if rollout data is available for this step
             partition_ids = sft_partition_ids(self.config, step)
-            partition_list = run(self.data_system_client.async_get_partition_list())
-
-            if partition_list is not None and all(partition_id in partition_list for partition_id in partition_ids):
+            is_local = local_text_sft(self.config)
+            partition_list = None if is_local else run(self.data_system_client.async_get_partition_list())
+            if is_local or (partition_list is not None and all(pid in partition_list for pid in partition_ids)):
                 self._logger.info(f"Data available for step {step}, executing training")
 
                 # Execute training
                 did_train = self._execute_training()
 
                 # Only clear partition data if clear_data is True
-                if clear_data and did_train:
+                if clear_data and did_train and not is_local:
                     for partition_id in partition_ids:
                         run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Cleared data partitions: {partition_ids}")

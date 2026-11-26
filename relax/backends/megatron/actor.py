@@ -663,6 +663,9 @@ class MegatronTrainRayActor(TrainRayActor):
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
         self.prof.on_init_end()
+        from relax.engine.sft.local_text import LocalTextBatches, local_text_sft
+
+        self._local_text_batches = LocalTextBatches(self.args, self.tokenizer) if local_text_sft(self.args) else None
         self.data_iterator = None
         self._sft_window_prefetcher = SFTWindowPrefetcher() if is_sft_async_prepack_enabled(self.args) else None
         self._sft_prefetch_stream = None
@@ -1660,6 +1663,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # token-budget rounds wait on straggling tail samples and their polling
         # backoff can turn a small producer skew into multi-second stalls.
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        if self._local_text_batches is not None:
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+            from relax.utils.data.stream_dataloader import _add_sft_token_lengths
+
+            rollout_data = self._local_text_batches.load(rollout_id, dp_rank, dp_size)
+            _add_sft_token_lengths(self.args, rollout_data)
+            return rollout_data
         batch_size = self._sft_prepack_local_batch_size()
         partition_ids = sft_partition_ids(self.args, rollout_id)
         num_shards = sft_tq_num_shards(self.args)

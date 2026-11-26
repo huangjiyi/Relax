@@ -41,4 +41,10 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
         args.sft_train_data_prefetch = lookahead and not args.sft_async_prepack
     else:
         args.sft_train_data_prefetch = False
+    from relax.engine.sft.local_text import local_text_sft
+
+    if local_text_sft(args):
+        args.sft_async_prepack = True
+        args.sft_train_data_prefetch = False
+        args.max_staleness = max(args.max_staleness, 1)
     configure_image_preprocessing(args, is_sft)
