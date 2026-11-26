@@ -12,6 +12,7 @@ set -eo pipefail
 if [[ ${1:-} == --help ]]; then
     echo "Set MODEL_DIR (HF model or its parent), DATA_DIR (containing train.jsonl), and SAVE_DIR."
     echo "Run with --dry-run to preview. Set PUBLISH_MODEL_NAME to publish the final HF export."
+    echo "Set OVERWRITE_RUN_DIR=1 to delete the previous run's output and start over."
     exit 0
 fi
 if (( $# > 1 )) || [[ -n ${1:-} && $1 != --dry-run ]]; then
@@ -162,6 +163,9 @@ if [[ -n ${ATTEMPT_ID:-} ]]; then
         --attempt "${ATTEMPT_ID}"
     )
 fi
+if [[ ${OVERWRITE_RUN_DIR:-0} == 1 ]]; then
+    LAUNCH_ARGS+=(--overwrite-run-dir)
+fi
 
 if [[ ${1:-} == --dry-run ]]; then
     LAUNCH_ARGS+=(--dry-run)
@@ -180,6 +184,11 @@ else
         set +x
     fi
     mkdir -p -- "${RUN_DIR}"
+    launch_log="${RUN_DIR}/launch-${now}.log"
+    if [[ ${OVERWRITE_RUN_DIR:-0} == 1 ]]; then
+        launch_log=$(mktemp --suffix=.log "${RUN_DIR}/launch-${now}-XXXXXX")
+        LAUNCH_ARGS+=(--launch-log-name "${launch_log##*/}")
+    fi
 fi
 
 TRAIN_ARGS=(
@@ -215,5 +224,5 @@ if [[ ${1:-} == --dry-run ]]; then
     make_job_spec | python3 "${SCRIPT_DIR}/relax_sft_train_and_publish.py" "${LAUNCH_ARGS[@]}"
 else
     make_job_spec | python3 "${SCRIPT_DIR}/relax_sft_train_and_publish.py" "${LAUNCH_ARGS[@]}" 2>&1 \
-        | tee "${RUN_DIR}/launch-${now}.log"
+        | tee "${launch_log}"
 fi

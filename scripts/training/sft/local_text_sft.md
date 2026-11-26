@@ -20,6 +20,9 @@ The recipe saves checkpoints and HF weights under `$SAVE_DIR/$EXP_NAME`.
 For a new experiment, choose a new `EXP_NAME`. Once a previous attempt has
 ended, set a new `ATTEMPT_ID` with the same save directory and experiment
 name to start another Ray job with the same native checkpoint load path.
+To restart from the base model with the same `EXP_NAME`, set `OVERWRITE_RUN_DIR=1`.
+This deletes the previous run's checkpoints, HF exports, and logs once its launcher
+has released the output directory lock. Clear `ATTEMPT_ID` when using overwrite.
 Set `DATA_PIPELINE=transfer-queue` to select the optional compact
 TransferQueue comparison.
 

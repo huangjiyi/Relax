@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import fcntl
 import importlib.util
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -80,6 +82,82 @@ def test_training_must_succeed(monkeypatch, status):
     monkeypatch.setattr(launcher, "ray_request", lambda *_: {"status": status})
     with pytest.raises(RuntimeError, match=status):
         launcher.wait_for_training("http://localhost", {"submission_id": "test"}, submit=False)
+
+
+@pytest.mark.parametrize("previous_run", ["idle", "locked", "active Ray job", "unrecognized"])
+def test_overwrite_run_resets_only_an_idle_training_directory(tmp_path, monkeypatch, previous_run):
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "output"
+    checkpoint.mkdir(parents=True)
+    old_weights = checkpoint / "old-weights"
+    old_weights.write_bytes(b"old checkpoint")
+    launch_log = run_dir / "launch-current.log"
+    launch_log.write_text("current launch")
+    sibling = tmp_path / "keep"
+    sibling.write_text("outside the training directory")
+    (run_dir / "link").symlink_to(sibling)
+    job_spec = tmp_path / "next.json"
+    entrypoint = [
+        "python3",
+        "-m",
+        "relax.entrypoints.train",
+        "--save",
+        str(checkpoint),
+        "--save-hf",
+        str(run_dir / "output_hf"),
+    ]
+    job_spec.write_text(json.dumps({"entrypoint": shlex.join(entrypoint)}))
+    prev_spec, _, _ = launcher.prepare_spec(job_spec, run_dir)
+    recorded = run_dir / "ray-submit.json"
+    if previous_run != "unrecognized":
+        recorded.write_text(json.dumps(prev_spec))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch",
+            "--job-spec",
+            str(job_spec),
+            "--run-dir",
+            str(run_dir),
+            "--overwrite-run-dir",
+            "--launch-log-name",
+            launch_log.name,
+        ],
+    )
+    ray_jobs = [{"status": "RUNNING"}] if previous_run == "active Ray job" else []
+    monkeypatch.setattr(launcher, "ray_request", lambda *_: ray_jobs)
+
+    class RaySubmissionReached(Exception):
+        pass
+
+    def wait_for_training(dashboard, spec, submit):
+        assert submit
+        assert spec["submission_id"] != prev_spec["submission_id"]
+        assert json.loads(recorded.read_text()) == spec
+        raise RaySubmissionReached
+
+    monkeypatch.setattr(launcher, "wait_for_training", wait_for_training)
+    lock_path = run_dir / "train-and-publish.lock"
+    with lock_path.open("a") as lock:
+        if previous_run == "locked":
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(BlockingIOError):
+                launcher.main()
+        elif previous_run == "active Ray job":
+            with pytest.raises(RuntimeError, match="active job"):
+                launcher.main()
+        elif previous_run == "unrecognized":
+            with pytest.raises(ValueError, match="without an existing job spec"):
+                launcher.main()
+        else:
+            with pytest.raises(RaySubmissionReached):
+                launcher.main()
+            assert lock_path.stat().st_ino == os.fstat(lock.fileno()).st_ino
+
+    assert old_weights.exists() == (previous_run != "idle")
+    assert launch_log.read_text() == "current launch"
+    assert sibling.read_text() == "outside the training directory"
 
 
 @pytest.mark.parametrize("success", [True, False])

@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -87,6 +89,33 @@ def lookup_job(dashboard: str, job_id: str) -> dict | None:
 def require_idle_cluster(dashboard: str) -> None:
     if any(job.get("status") in ("PENDING", "RUNNING") for job in ray_request(dashboard)):
         raise RuntimeError("The Ray cluster already has an active job.")
+
+
+def reset_run_directory(run_dir: Path, checkpoint: Path, keep_names: set[str]) -> None:
+    # Keep the lock inode while removing the previous run's data.
+    contents = [path for path in run_dir.iterdir() if path.name not in keep_names]
+    if not contents:
+        return
+    records = [
+        path for path in contents if path.match("ray-submit*.json") and not path.is_symlink() and path.is_file()
+    ]
+    for record in records:
+        entrypoint = json.loads(record.read_text()).get("entrypoint", "")
+        argv = shlex.split(entrypoint)
+        if "--save" not in argv:
+            continue
+        save_index = argv.index("--save") + 1
+        if argv[save_index : save_index + 1] == [str(checkpoint)]:
+            break
+    else:
+        raise ValueError(f"Refusing to overwrite {run_dir} without an existing job spec for this directory.")
+
+    # Delete the records last so a failed cleanup can be retried.
+    for path in sorted(contents, key=lambda path: path in records):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def wait_for_training(dashboard: str, spec: dict, submit: bool) -> None:
@@ -229,6 +258,10 @@ def main() -> None:
     parser.add_argument("--model-name", help="Destination model name in the QS registry.")
     parser.add_argument("--run-dir", type=Path, help="Submit a new run here. Otherwise wait for the existing job.")
     parser.add_argument("--attempt", help="Name a new Ray attempt that resumes from the same run directory.")
+    parser.add_argument(
+        "--overwrite-run-dir", action="store_true", help="Delete the previous run and start a new one."
+    )
+    parser.add_argument("--launch-log-name", help="Name of the current launcher log to keep during overwrite.")
     parser.add_argument("--prepare-dir", type=Path, help="Build local text caches for a new run from its JSONL input.")
     parser.add_argument("--prep-workers", type=int, default=14)
     parser.add_argument("--ray-dashboard", default="http://127.0.0.1:8265")
@@ -247,6 +280,10 @@ def main() -> None:
 
     run_dir = args.run_dir.resolve() if args.run_dir else None
     prepare_dir = args.prepare_dir.resolve() if args.prepare_dir else None
+    if args.overwrite_run_dir and (run_dir is None or args.attempt or args.run_dir.is_symlink()):
+        parser.error("--overwrite-run-dir requires a real --run-dir and cannot be combined with --attempt.")
+    if args.launch_log_name and not Path(args.launch_log_name).match("launch-*.log"):
+        parser.error("--launch-log-name must match launch-*.log.")
     if prepare_dir is not None and (run_dir is None or args.prep_workers < 1):
         parser.error("--prepare-dir requires --run-dir and a positive --prep-workers value.")
     spec, checkpoint, template = prepare_spec(args.job_spec, run_dir, prepare_dir)
@@ -258,6 +295,17 @@ def main() -> None:
         attempt_key = hashlib.sha256(args.attempt.encode()).hexdigest()[:12]
         spec["submission_id"] += f"-{attempt_key}"
         recorded_name = f"ray-submit-{attempt_key}.json"
+    elif args.overwrite_run_dir:
+        argv = shlex.split(spec["entrypoint"])
+        for flag in ("--hf-checkpoint", "--ref-load", "--prompt-data", "--load"):
+            if flag not in argv:
+                continue
+            value = argv[argv.index(flag) + 1]
+            if value == str(checkpoint) and flag == "--load":
+                continue
+            if "://" not in value and Path(value).resolve().is_relative_to(run_dir):
+                parser.error(f"--overwrite-run-dir would delete the input to {flag}.")
+        spec["submission_id"] += f"-{uuid4().hex[:12]}"
     print(f"Ray job {spec['submission_id']} | checkpoint {checkpoint} | HF {template}")
     if args.model_name:
         print(f"QS model {args.model_name} | precision {args.precision}")
@@ -282,9 +330,16 @@ def main() -> None:
 
     record_dir = run_dir or checkpoint.parent
     record_dir.mkdir(parents=True, exist_ok=True)
-    with (record_dir / "train-and-publish.lock").open("a") as lock:
+    lock_path = record_dir / "train-and-publish.lock"
+    with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if run_dir is not None:
+            if args.overwrite_run_dir:
+                require_idle_cluster(args.ray_dashboard)
+                keep_names = {lock_path.name}
+                if args.launch_log_name:
+                    keep_names.add(args.launch_log_name)
+                reset_run_directory(run_dir, checkpoint, keep_names)
             recorded_spec = run_dir / recorded_name
             if recorded_spec.exists():
                 if json.loads(recorded_spec.read_text()) != spec:
